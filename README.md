@@ -36,10 +36,12 @@ Open it on a phone and use "Add to Home Screen" for a full-screen app-like view.
 
 ## Update
 
-Edit the files here and push:
+Edit the files here, then commit them to
+<https://github.com/Kipburger-lab/elorin-market>. The GitHub web editor is enough
+(open a file → pencil → Commit changes), or clone and push:
 
 ```
-git add -A && git commit -m "update dashboard" && git push
+git clone https://github.com/Kipburger-lab/elorin-market.git
 ```
 
 Schema and setup instructions live in the main project README (`supabase.sql`).

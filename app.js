@@ -29,6 +29,8 @@ const state = {
   recent: [],
   since: 0,
   updatedAt: 0,
+  statusHtml: "loading…",
+  signature: "",
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -118,14 +120,28 @@ async function rpc(fn, body) {
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────
-async function load() {
+/// Repaint the status line; the age is re-rendered every second so it is
+/// obvious the page is live.
+function paintStatus() {
+  const age = state.updatedAt ? ` · updated ${timeAgo(state.updatedAt)}` : "";
+  $("status").innerHTML = state.statusHtml + `<span class="hint">${age}</span>`;
+}
+
+function setStatus(html) {
+  state.statusHtml = html;
+  paintStatus();
+}
+
+/// Fetch everything for the current window. `quiet` skips the loading flash for
+/// background refreshes, and identical data skips the DOM work entirely.
+async function load(quiet) {
   if (!CFG.supabaseUrl || CFG.supabaseUrl.includes("YOUR-PROJECT")) {
-    $("status").innerHTML = `Set <b>supabaseUrl</b> and <b>anonKey</b> in config.js`;
+    setStatus(`Set <b>supabaseUrl</b> and <b>anonKey</b> in config.js`);
     return;
   }
   const w = WINDOWS[state.win];
   state.since = Date.now() - w.ms;
-  $("status").textContent = "loading…";
+  if (!quiet) setStatus("loading…");
   try {
     const [items, series, hours, recent] = await Promise.all([
       rpc("item_stats", { since_ms: state.since }),
@@ -141,11 +157,18 @@ async function load() {
     state.updatedAt = Date.now();
 
     const offers = state.items.reduce((a, i) => a + i.n, 0);
-    $("status").textContent =
-      `${state.items.length} items · ${fmt(offers)} offers · last ${w.label.toLowerCase()} · updated ${timeAgo(state.updatedAt)}`;
-    render();
+    setStatus(`${state.items.length} items · ${fmt(offers)} offers · last ${w.label.toLowerCase()}`);
+
+    // Only touch the DOM when something actually changed, so a 5 s refresh
+    // cadence doesn't flicker or fight the user's scrolling.
+    const sig = state.win + "|" + state.items.map(i => `${i.name}:${i.n}:${i.low}:${i.median}:${i.last}`).join(",")
+      + "|" + state.hours.map(h => `${h.hour}:${h.n}:${h.idx}`).join(",");
+    if (sig !== state.signature) {
+      state.signature = sig;
+      render();
+    }
   } catch (e) {
-    $("status").innerHTML = `<span class="warn">${esc(e.message)}</span>`;
+    setStatus(`<span class="warn">${esc(e.message)}</span>`);
   }
 }
 
@@ -507,6 +530,7 @@ document.addEventListener("keydown", e => { if (e.key === "Escape") closeDetail(
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 load();
+setInterval(paintStatus, 1000);
 if (CFG.autoRefreshSeconds > 0) {
-  setInterval(() => { if ($("detail").classList.contains("hidden")) load(); }, CFG.autoRefreshSeconds * 1000);
+  setInterval(() => load(true), CFG.autoRefreshSeconds * 1000);
 }

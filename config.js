@@ -18,6 +18,7 @@ window.ELORIN_CONFIG = {
   // How many items to show in the best-investments strip.
   topInvestments: 12,
 
-  // Reload the data every N seconds (0 = off).
-  autoRefreshSeconds: 60,
+  // Reload the data every N seconds (0 = off). Background refreshes are quiet —
+  // identical data doesn't re-render, so this can be small.
+  autoRefreshSeconds: 5,
 };

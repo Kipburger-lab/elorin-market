@@ -2,8 +2,9 @@
 
 // Elorin Buy Manager — the controller for the scanner's buy rules.
 //
-// Reads are public (publishable key); writes go through Supabase Auth so only
-// the signed-in owner can change what the scanner is allowed to buy.
+// Private: the page shows nothing but a sign-in card until authenticated, and
+// the rules it edits are unreadable anonymously (RLS grants select on
+// `watchlist` / `buy_settings` to authenticated users only).
 
 const CFG = Object.assign({
   supabaseUrl: "",
@@ -131,7 +132,6 @@ async function signIn(email, password) {
     email: (data.user && data.user.email) || email,
     expires_at: Date.now() + (Number(data.expires_in) || 3600) * 1000,
   });
-  renderAuth();
 }
 
 async function refreshAuth() {
@@ -153,7 +153,6 @@ async function refreshAuth() {
     return true;
   } catch {
     saveAuth(null);
-    renderAuth();
     return false;
   }
 }
@@ -314,6 +313,10 @@ async function load() {
     setStatus(`Set <b>supabaseUrl</b> and <b>anonKey</b> in config.js`);
     return;
   }
+  if (!state.auth) {
+    showGate();
+    return;
+  }
   setStatus("loading…");
   const w = WINDOWS[state.win];
   state.since = Date.now() - w.ms;
@@ -338,43 +341,74 @@ async function load() {
     state.rules = new Map((rules || []).map(r => [r.name, r]));
     state.settings = (settings || [])[0] || { id: 1, enabled: false, min_margin: 1e9, max_snipes: 2, snipes_used: 0 };
     setStatus(statusLine());
-    renderAuth();
+    showApp();
     renderRules();
     renderItems();
   } catch (e) {
-    // Still render the chrome: a broken fetch (e.g. the schema hasn't been
-    // created yet) must not leave the page with no way to sign in.
+    // A rejected token (or the schema not existing yet) sends us back to the
+    // gate rather than showing a half-rendered page.
+    if (!state.auth) {
+      showGate();
+      return;
+    }
     setStatus(`<span class="warnbox">${esc(e.message)}</span>`);
     renderAuth();
     renderRules();
   }
 }
 
-// ── Render: auth bar ──────────────────────────────────────────────────────
-function renderAuth() {
-  const el = $("auth");
-  if (state.auth) {
-    el.innerHTML = `<span class="who">${esc(state.auth.email || "signed in")}</span>
-      <button class="ghost" id="signout">Sign out</button>`;
-    $("signout").onclick = () => { saveAuth(null); renderAuth(); renderRules(); renderItems(); setStatus(statusLine()); };
-    return;
-  }
-  el.innerHTML = `
-    <input id="email" type="email" placeholder="email" autocomplete="username">
-    <input id="pw" type="password" placeholder="password" autocomplete="current-password">
-    <button class="ghost" id="signin">Sign in to edit</button>`;
+// ── Gate: the app is invisible until signed in ────────────────────────────
+function showGate() {
+  $("app").hidden = true;
+  $("gate").hidden = false;
+  $("auth").innerHTML = "";
+  $("status").textContent = "";
+  $("body").innerHTML = "";
+  state.items = [];
+  state.rules = new Map();
+  state.settings = null;
+  const e = $("email");
+  if (e) e.focus();
+}
+
+function showApp() {
+  $("gate").hidden = true;
+  $("app").hidden = false;
+  renderAuth();
+}
+
+function wireGate() {
   const go = async () => {
+    $("gateErr").textContent = "";
+    const btn = $("signin");
+    btn.disabled = true;
     try {
       await signIn($("email").value.trim(), $("pw").value);
-      setStatus(statusLine());
-      renderRules();
-      renderItems();
-    } catch (e) {
-      setStatus(`<span class="warnbox">${esc(e.message)}</span>`);
+      showApp();
+      await load();
+    } catch (err) {
+      $("gateErr").textContent = err.message;
+      $("pw").value = "";
+    } finally {
+      btn.disabled = false;
     }
   };
   $("signin").onclick = go;
   $("pw").onkeydown = e => { if (e.key === "Enter") go(); };
+  $("email").onkeydown = e => { if (e.key === "Enter") $("pw").focus(); };
+}
+
+// ── Render: auth bar ──────────────────────────────────────────────────────
+function renderAuth() {
+  const el = $("auth");
+  if (!state.auth) {
+    el.innerHTML = "";
+    return;
+  }
+  el.innerHTML = `<span class="who">${esc(state.auth.email || "signed in")}</span>
+    <button class="ghost" id="signout">Sign out</button>`;
+  // Reload rather than re-render, so nothing from the session is left on screen.
+  $("signout").onclick = () => { saveAuth(null); location.reload(); };
 }
 
 // ── Render: session rules ─────────────────────────────────────────────────
@@ -645,7 +679,11 @@ $("reload").addEventListener("click", load);
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 loadAuth();
-renderAuth();
-renderRules();
-load();
+wireGate();
+if (state.auth) {
+  showApp();
+  load();
+} else {
+  showGate();
+}
 setInterval(() => { if (state.auth) token(); }, 10 * 60 * 1000);

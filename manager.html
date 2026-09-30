@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#12100c">
+<meta name="robots" content="noindex, nofollow">
 <title>Elorin Buy Manager</title>
 <link rel="stylesheet" href="styles.css">
 <link rel="stylesheet" href="manager.css">
@@ -19,10 +20,22 @@
     <div class="auth" id="auth"></div>
     <button id="reload" class="ghost" title="Reload">⟳</button>
   </div>
-  <div class="status" id="status">loading…</div>
+  <div class="status" id="status"></div>
 </header>
 
-<main>
+<div id="gate" class="gate">
+  <div class="gateCard">
+    <div class="gateTitle">Private</div>
+    <p class="hint">Sign in to open the buy manager. The rules it holds are not
+      readable without this account.</p>
+    <input id="email" type="email" placeholder="email" autocomplete="username" spellcheck="false">
+    <input id="pw" type="password" placeholder="password" autocomplete="current-password">
+    <button class="ghost gateGo" id="signin">Sign in</button>
+    <div class="gateErr" id="gateErr"></div>
+  </div>
+</div>
+
+<main id="app" hidden>
   <section class="panel">
     <h2>Session rules
       <span class="hint">a buy needs the master switch <em>and</em> the item ticked</span>

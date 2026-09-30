@@ -5,8 +5,8 @@ Two static pages (no server, no build step) that read the offers collected by
 
 | Page | What it is |
 |------|------------|
-| `index.html` | **Dashboard** — read-only. Day/Week/Month windows, best investments after the 10% fee, search, per-item history, hourly insights. |
-| `manager.html` | **Buy Manager** — the controller. Sets the rules the scanner obeys. |
+| `index.html` | **Dashboard** — public, read-only. Day/Week/Month windows, best investments after the 10% fee, search, per-item history, hourly insights. |
+| `manager.html` | **Buy Manager** — private. Sets the rules the scanner obeys. |
 
 ## Configure
 
@@ -42,14 +42,21 @@ its price context, and writes the rules the scanner reads:
   bait listing, which is why p10 is shown too.
 - `1b` / `250m` / `20k` shorthand works in the price fields.
 
-### Why the login
+### It is private
 
-These settings decide what the scanner spends money on, and the publishable key
-is public, so **writes require signing in** (Supabase email + password). Reads
-stay anonymous. Create the account in Supabase → Authentication → Users →
-*Add user* (tick auto-confirm), then sign in from the manager's top bar.
+These settings decide what the scanner spends money on, and the publishable key is
+public, so the manager is gated twice over:
 
-Signed out you can still browse everything — the inputs are just disabled.
+1. **The page** renders nothing but a sign-in card until you authenticate — and it
+   is deliberately not linked from the public dashboard (`index.html` has no
+   Manager link), so a visitor can't stumble onto it.
+2. **The data** is unreadable anonymously: RLS on `watchlist` and `buy_settings`
+   grants `select` to *authenticated* only, so even someone who knows the URL and
+   the publishable key gets nothing from the API. The scanner reads them with the
+   service key, which bypasses RLS.
+
+Create the account in Supabase → Authentication → Users → **Add user** (tick
+auto-confirm), then sign in. Signing out reloads the page back to the gate.
 
 ### Session counters
 
@@ -66,6 +73,7 @@ Note: Pages currently publishes the `gh-pages` branch, so a change pushed to
 `main` and drop the extra branch).
 
 Open it on a phone and use "Add to Home Screen" for a full-screen app-like view.
+Bookmark `manager.html` directly — nothing links to it.
 
 ## Housekeeping
 

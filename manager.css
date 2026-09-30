@@ -1,22 +1,61 @@
 /* Manager-only additions; the theme and .nav come from styles.css. */
 
-/* ── sign-in bar ────────────────────────────────────────────────────── */
-.auth { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* ── login gate ─────────────────────────────────────────────────────────── */
+.gate {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--bg);
+  z-index: 30;
+}
 
-.auth input {
+.gate[hidden] { display: none; }
+
+.gateCard {
+  width: 100%;
+  max-width: 340px;
   background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gateTitle {
+  color: var(--gold);
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+.gateCard input {
+  background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--text);
-  padding: 5px 8px;
+  padding: 9px 10px;
   font: inherit;
-  width: 150px;
 }
+
+.gateCard input:focus { outline: 1px solid var(--gold); }
+
+.gateGo { padding: 9px 10px; color: var(--text); }
+
+.gateErr { color: var(--red); font-size: 12px; min-height: 15px; }
+
+/* ── auth bar (once inside) ─────────────────────────────────────────────── */
+.auth { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
 .auth .who { color: var(--green); font-size: 12px; }
 .auth .none { color: var(--dim); font-size: 12px; }
 
-/* ── global rules ───────────────────────────────────────────────────── */
+/* ── global rules ───────────────────────────────────────────────────────── */
 .rules {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
@@ -48,7 +87,7 @@
 .master { display: flex; align-items: center; gap: 8px; }
 .master input { width: 18px; height: 18px; }
 
-/* ── item table ─────────────────────────────────────────────────────── */
+/* ── item table ─────────────────────────────────────────────────────────── */
 .mtable { min-width: 1000px; }
 .mtable th, .mtable td { padding: 5px 8px; }
 .mtable input[type="number"] {

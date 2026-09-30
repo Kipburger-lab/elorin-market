@@ -82,6 +82,22 @@ header {
 
 .status { padding: 0 12px 8px; color: var(--dim); font-size: 12px; }
 
+/* ── top nav (dashboard ⇄ manager) ──────────────────────────────────── */
+.nav { display: flex; gap: 6px; }
+
+.nav a {
+  color: var(--dim);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font: inherit;
+}
+
+.nav a.active { color: #1a1509; background: var(--gold); border-color: var(--gold); font-weight: 700; }
+.nav a:hover { border-color: var(--gold); }
+
 /* ── layout ─────────────────────────────────────────────────────────── */
 main { padding: 12px; max-width: 1100px; margin: 0 auto; }
 

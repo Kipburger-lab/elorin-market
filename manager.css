@@ -1,0 +1,105 @@
+/* Manager-only additions; the theme and .nav come from styles.css. */
+
+/* ── sign-in bar ────────────────────────────────────────────────────── */
+.auth { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.auth input {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 5px 8px;
+  font: inherit;
+  width: 150px;
+}
+
+.auth .who { color: var(--green); font-size: 12px; }
+.auth .none { color: var(--dim); font-size: 12px; }
+
+/* ── global rules ───────────────────────────────────────────────────── */
+.rules {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.rule { display: flex; flex-direction: column; gap: 4px; }
+.rule label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; }
+.rule .row { display: flex; align-items: center; gap: 6px; }
+
+.rules input[type="number"], .rules input[type="text"] {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 7px;
+  font: inherit;
+  width: 100%;
+}
+
+.rules input.dirty { border-color: var(--gold); }
+
+.big { font-size: 18px; font-weight: 700; }
+
+.master { display: flex; align-items: center; gap: 8px; }
+.master input { width: 18px; height: 18px; }
+
+/* ── item table ─────────────────────────────────────────────────────── */
+.mtable { min-width: 1000px; }
+.mtable th, .mtable td { padding: 5px 8px; }
+.mtable input[type="number"] {
+  width: 118px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 3px 6px;
+  font: inherit;
+  text-align: right;
+}
+.mtable input[type="number"].dirty { border-color: var(--gold); }
+.mtable input[type="checkbox"] { width: 17px; height: 17px; }
+
+.mtable tr.off td { opacity: 0.55; }
+.mtable tr.on { background: rgba(110, 224, 122, 0.05); }
+.mtable tr.on td:first-child { box-shadow: inset 2px 0 0 var(--green); }
+
+.state { font-size: 11px; color: var(--dim); min-width: 52px; display: inline-block; }
+.state.ok { color: var(--green); }
+.state.err { color: var(--red); }
+
+.badge {
+  display: inline-block;
+  background: var(--gold);
+  color: #1a1509;
+  border-radius: 4px;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.qty-ok { color: var(--dim); }
+.qty-done { color: var(--green); font-weight: 700; }
+
+.tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 8px; }
+.tools input[type="search"] {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 6px 10px;
+  font: inherit;
+  flex: 1 1 160px;
+}
+.tools label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 4px; }
+
+.trend { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin: 4px 0; }
+.trend .empty { padding: 4px; }
+
+.hintline { color: var(--dim); font-size: 12px; margin: 6px 0 10px; }
+.warnbox { color: var(--red); font-size: 12px; }

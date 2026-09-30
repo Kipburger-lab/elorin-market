@@ -342,7 +342,11 @@ async function load() {
     renderRules();
     renderItems();
   } catch (e) {
+    // Still render the chrome: a broken fetch (e.g. the schema hasn't been
+    // created yet) must not leave the page with no way to sign in.
     setStatus(`<span class="warnbox">${esc(e.message)}</span>`);
+    renderAuth();
+    renderRules();
   }
 }
 
@@ -641,5 +645,7 @@ $("reload").addEventListener("click", load);
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 loadAuth();
+renderAuth();
+renderRules();
 load();
 setInterval(() => { if (state.auth) token(); }, 10 * 60 * 1000);

@@ -1,15 +1,12 @@
 # Elorin Market dashboard
 
-Static page (no server, no build step) that reads the offers collected by
-`market_scanner.exe` straight from Supabase, and shows:
+Two static pages (no server, no build step) that read the offers collected by
+`market_scanner.exe` straight from Supabase.
 
-- **Day / Week / Month** windows (24 h, 7 days, 30 days),
-- **Best investments** — buy at the lowest price seen, resell at the median,
-  after the 10% market fee: `margin% = (median × 0.9 − low) / low`,
-- a sortable **items table** with search that filters and highlights matches,
-- **item detail** (tap a row) — icon, stats, price trend, recent offers,
-- **insights** — busiest/cheapest hour, activity by hour, price level by hour
-  (normalised index), biggest risers and fallers.
+| Page | What it is |
+|------|------------|
+| `index.html` | **Dashboard** — read-only. Day/Week/Month windows, best investments after the 10% fee, search, per-item history, hourly insights. |
+| `manager.html` | **Buy Manager** — the controller. Sets the rules the scanner obeys. |
 
 ## Configure
 
@@ -22,26 +19,58 @@ Everything lives in `config.js`:
 | `feeRate` | market fee off the sale price (0.10 = 10%) |
 | `minObservations` | minimum sightings before an item can rank as an investment |
 | `topInvestments` | how many cards in the best-investments strip |
-| `autoRefreshSeconds` | reload cadence (0 disables) |
+| `autoRefreshSeconds` | dashboard reload cadence (0 disables) |
 
 The `sb_secret_…` key must never appear here — it stays in the scanner's local
 `market.toml`.
 
+## Buy Manager
+
+Lists **every** item ever seen (new ones appear on their own, icon included) with
+its price context, and writes the rules the scanner reads:
+
+- **per item** — a `Buy` tick, a `Max price` threshold, and a per-session quantity
+  cap. Once the scanner has bought that many, the row stops being eligible (and
+  the manager flags it).
+- **session rules** — a master switch (nothing is bought unless both it *and* the
+  row are on), a **big-snipe profit floor** in absolute gp, and how many such
+  snipes are allowed per session (`0` = never).
+- A **SNIPE** badge marks rows whose estimated profit clears that floor — exactly
+  the ones that consume the rationed slots.
+- The log-scaled **spread bar** shows low / p10 / median / high with your
+  threshold marked, so you can see where you're buying. `low` is often a 1 gp
+  bait listing, which is why p10 is shown too.
+- `1b` / `250m` / `20k` shorthand works in the price fields.
+
+### Why the login
+
+These settings decide what the scanner spends money on, and the publishable key
+is public, so **writes require signing in** (Supabase email + password). Reads
+stay anonymous. Create the account in Supabase → Authentication → Users →
+*Add user* (tick auto-confirm), then sign in from the manager's top bar.
+
+Signed out you can still browse everything — the inputs are just disabled.
+
+### Session counters
+
+`bought` counts and the big-snipe tally reset per scanner run; **Reset** in the
+manager zeroes them without restarting the scanner.
+
 ## Deploy (free, GitHub Pages)
 
-Settings → Pages → **Deploy from a branch** → `main` / `(root)` → Save.
-The page appears at `https://<user>.github.io/elorin-market/`.
+Settings → Pages → **Deploy from a branch** → branch / `(root)` → Save.
+Live at <https://kipburger-lab.github.io/elorin-market/>.
+
+Note: Pages currently publishes the `gh-pages` branch, so a change pushed to
+`main` also has to be merged into `gh-pages` (or switch the Pages source to
+`main` and drop the extra branch).
 
 Open it on a phone and use "Add to Home Screen" for a full-screen app-like view.
 
-## Update
+## Housekeeping
 
-Edit the files here, then commit them to
-<https://github.com/Kipburger-lab/elorin-market>. The GitHub web editor is enough
-(open a file → pencil → Commit changes), or clone and push:
+Raw rows grow ~1k/hour. Delete anything older than 90 days occasionally:
 
+```sql
+select public.prune_offers(90);
 ```
-git clone https://github.com/Kipburger-lab/elorin-market.git
-```
-
-Schema and setup instructions live in the main project README (`supabase.sql`).

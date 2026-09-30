@@ -343,7 +343,9 @@ async function load() {
     setStatus(statusLine());
     showApp();
     renderRules();
+    renderBanner();
     renderItems();
+    refreshScannerState();
   } catch (e) {
     // A rejected token (or the schema not existing yet) sends us back to the
     // gate rather than showing a half-rendered page.
@@ -375,6 +377,7 @@ function showApp() {
   $("gate").hidden = true;
   $("app").hidden = false;
   renderAuth();
+  renderBanner();
 }
 
 function wireGate() {
@@ -396,6 +399,65 @@ function wireGate() {
   $("signin").onclick = go;
   $("pw").onkeydown = e => { if (e.key === "Enter") go(); };
   $("email").onkeydown = e => { if (e.key === "Enter") $("pw").focus(); };
+}
+
+// ── Render: scanner state banner ──────────────────────────────────────────
+/// What the scanner is actually doing, from the heartbeat it publishes. This is
+/// the answer to "why didn't it buy?" — mode, liveness and the master switch in
+/// one line, instead of digging through a log file.
+function renderBanner() {
+  const el = $("banner");
+  if (!el) return;
+  const s = state.settings || {};
+
+  if (!s.scanner_seen) {
+    el.className = "banner";
+    el.innerHTML = `Scanner: <b>never seen</b><span class="hint">Start market_scanner.exe. Until it checks in, nothing will be bought.</span>`;
+    return;
+  }
+
+  const seen = Date.parse(s.scanner_seen);
+  const quiet = Date.now() - seen > 120000;
+  const dry = s.scanner_dry_run !== false;
+
+  let cls, head, hint;
+  if (quiet) {
+    cls = "dead";
+    head = `Scanner: not seen for ${timeAgo(seen)}`;
+    hint = "The loop isn't running (or it can't reach Supabase) — nothing is being bought.";
+  } else if (dry) {
+    cls = "warn";
+    head = `Scanner: DRY RUN · seen ${timeAgo(seen)}`;
+    hint = "It reports what it would buy but never clicks. Set dry_run = false in market.toml (next to the exe), then restart it.";
+  } else if (!s.enabled) {
+    cls = "warn";
+    head = `Scanner: LIVE · seen ${timeAgo(seen)}`;
+    hint = "Armed, but the master switch below is OFF — nothing will be bought.";
+  } else {
+    cls = "ok";
+    head = `Scanner: LIVE · seen ${timeAgo(seen)}`;
+    hint = "Armed: ticked items are bought at or below their max price.";
+  }
+  el.className = "banner " + cls;
+  el.innerHTML = `${esc(head)}<span class="hint">${esc(hint)}</span>`;
+}
+
+/// The scanner publishes scanner_* every ~20s. Refresh just those fields so the
+/// banner notices a stopped or restarted scanner, without touching edits in
+/// progress (enabled / min_margin / max_snipes stay as the form has them).
+async function refreshScannerState() {
+  if (!state.auth || !state.settings) return;
+  try {
+    const rows = await rest("buy_settings?select=scanner_dry_run,scanner_seen&id=eq.1");
+    const r = (rows || [])[0];
+    if (r) {
+      state.settings.scanner_dry_run = r.scanner_dry_run;
+      state.settings.scanner_seen = r.scanner_seen;
+      renderBanner();
+    }
+  } catch {
+    /* the banner keeps its last reading; the age still ticks up */
+  }
 }
 
 // ── Render: auth bar ──────────────────────────────────────────────────────
@@ -444,7 +506,7 @@ function renderRules() {
     </div>`;
 
   if (state.auth) {
-    $("enabled").onchange = e => { state.settings.enabled = e.target.checked; renderRules(); debounceSettings(); };
+    $("enabled").onchange = e => { state.settings.enabled = e.target.checked; renderRules(); renderBanner(); debounceSettings(); };
     $("min_margin").oninput = e => { const v = parseMoney(e.target.value); if (v != null) state.settings.min_margin = v; e.target.classList.toggle("dirty", v == null); };
     $("min_margin").onblur = e => { e.target.value = fmt(state.settings.min_margin); e.target.classList.remove("dirty"); renderItems(); };
     $("min_margin").onchange = () => { debounceSettings(); renderItems(); };
@@ -687,3 +749,6 @@ if (state.auth) {
   showGate();
 }
 setInterval(() => { if (state.auth) token(); }, 10 * 60 * 1000);
+// Keep the "seen Ns ago" honest, and notice a restarted scanner.
+setInterval(renderBanner, 1000);
+setInterval(refreshScannerState, 30000);

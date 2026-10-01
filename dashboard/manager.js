@@ -337,10 +337,20 @@ function currentPreset() {
 
 function renderPresetSelect() {
   const sel = $("presetSelect");
+  if (!sel) return;
   const presets = getPresets();
   const current = sel.value;
-  sel.innerHTML = `<option value="">— choose a preset —</option>` +
-    Object.keys(presets).map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  sel.innerHTML = "";
+  const def = document.createElement("option");
+  def.value = "";
+  def.textContent = "— choose a preset —";
+  sel.appendChild(def);
+  Object.keys(presets).forEach(n => {
+    const opt = document.createElement("option");
+    opt.value = n;
+    opt.textContent = n;
+    sel.appendChild(opt);
+  });
   if (presets[current]) sel.value = current;
 }
 
@@ -354,12 +364,17 @@ function showPresetStatus(msg, isErr) {
 function savePreset() {
   const name = $("presetName").value.trim();
   if (!name) { showPresetStatus("enter a preset name", true); return; }
-  const presets = getPresets();
-  presets[name] = currentPreset();
-  setPresets(presets);
-  renderPresetSelect();
-  $("presetSelect").value = name;
-  showPresetStatus("saved");
+  try {
+    const presets = getPresets();
+    presets[name] = currentPreset();
+    setPresets(presets);
+    renderPresetSelect();
+    $("presetSelect").value = name;
+    showPresetStatus("saved");
+  } catch (e) {
+    showPresetStatus("save failed: " + e.message, true);
+    console.error("savePreset", e);
+  }
 }
 
 function loadPreset() {

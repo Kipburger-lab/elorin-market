@@ -377,7 +377,7 @@ function savePreset() {
   }
 }
 
-function loadPreset() {
+async function loadPreset() {
   const name = $("presetSelect").value;
   if (!name) { showPresetStatus("choose a preset first", true); return; }
   const presets = getPresets();
@@ -393,9 +393,9 @@ function loadPreset() {
     state.settings.min_margin = p.min_margin ?? 1e9;
     state.settings.max_snipes = p.max_snipes ?? 2;
   }
-  saveSettings();
 
-  (p.rules || []).forEach(r => {
+  const rules = (p.rules || []).filter(r => r.name);
+  rules.forEach(r => {
     state.rules.set(r.name, {
       name: r.name,
       buy: !!r.buy,
@@ -403,13 +403,21 @@ function loadPreset() {
       qty_limit: r.qty_limit != null ? Number(r.qty_limit) : 1,
       bought: 0,
     });
-    saveRow(r.name);
   });
+
+  try {
+    await saveSettings();
+    await Promise.all(rules.map(r => saveRow(r.name)));
+  } catch (e) {
+    showPresetStatus("sync failed: " + e.message, true);
+    console.error("loadPreset", e);
+    return;
+  }
 
   renderRules();
   renderBanner();
   renderItems();
-  showPresetStatus("loaded");
+  showPresetStatus(`loaded · ${rules.filter(r => r.buy).length} enabled · master ${state.settings.enabled ? "ON" : "off"}`);
 }
 
 function deletePreset() {

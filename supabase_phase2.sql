@@ -58,6 +58,7 @@ returns table (
   n           bigint,
   low         bigint,
   p10         bigint,
+  high        bigint,
   median      double precision,
   avg         double precision,
   last_price  bigint,
@@ -71,6 +72,7 @@ language sql stable as $$
     count(*)::bigint,
     min(price),
     round(percentile_cont(0.1) within group (order by price))::bigint,
+    max(price),
     percentile_cont(0.5) within group (order by price),
     avg(price)::double precision,
     (array_agg(price order by ts_ms desc))[1],
@@ -174,3 +176,35 @@ language sql stable as $$
 $$;
 
 grant execute on function public.item_series_for(text, bigint, text) to anon, authenticated;
+
+-- ── Seller / player pages ─────────────────────────────────────────────────
+-- rpc/seller_list {"p_search": "foo", "lim": 200}
+drop function if exists public.seller_list(text, int);
+create function public.seller_list(p_search text default '', lim int default 200)
+returns table (seller text, n bigint, last_ts_ms bigint)
+language sql stable as $$
+  select
+    coalesce(seller, 'Unknown') as seller,
+    count(*)::bigint as n,
+    max(ts_ms) as last_ts_ms
+  from public.offers
+  where (p_search = '' or seller ilike '%' || p_search || '%')
+  group by coalesce(seller, 'Unknown')
+  order by max(ts_ms) desc
+  limit lim;
+$$;
+
+-- rpc/seller_offers {"p_seller": "foo", "lim": 200}
+drop function if exists public.seller_offers(text, int);
+create function public.seller_offers(p_seller text, lim int default 200)
+returns setof public.offers
+language sql stable as $$
+  select *
+  from public.offers
+  where coalesce(seller, 'Unknown') = p_seller
+  order by ts_ms desc
+  limit lim;
+$$;
+
+grant execute on function public.seller_list(text, int)   to anon, authenticated;
+grant execute on function public.seller_offers(text, int) to anon, authenticated;

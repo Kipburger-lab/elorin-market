@@ -123,7 +123,7 @@ async function rpc(fn, body) {
 /// Repaint the status line; the age is re-rendered every second so it is
 /// obvious the page is live.
 function paintStatus() {
-  const age = state.updatedAt ? ` · updated ${timeAgo(state.updatedAt)}` : "";
+  const age = state.updatedAt ? ` · updated ${dateTime(state.updatedAt)}` : "";
   $("status").innerHTML = state.statusHtml + `<span class="hint">${age}</span>`;
 }
 
@@ -486,13 +486,13 @@ async function openDetail(name) {
     $("detailOffers").innerHTML = !rows.length
       ? `<div class="empty">no offers in this window</div>`
       : `<div class="tableWrap"><table class="offers">
-          <thead><tr><th>When</th><th>Seller</th><th class="num">Price</th><th class="num">Qty</th></tr></thead>
-          <tbody>${rows.map(r => `<tr>
-            <td>${timeAgo(Number(r.ts_ms))}</td>
-            <td>${esc(r.seller || "–")}</td>
-            <td class="num">${fmt(r.price)}</td>
-            <td class="num">${fmt(r.quantity)}</td>
-          </tr>`).join("")}</tbody></table></div>`;
+      <thead><tr><th>When</th><th>Seller</th><th class="num">Price</th><th class="num">Qty</th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td>${dateTime(Number(r.ts_ms))}</td>
+        <td>${esc(r.seller || "–")}</td>
+        <td class="num">${fmt(r.price)}</td>
+        <td class="num">${fmt(r.quantity)}</td>
+      </tr>`).join("")}</tbody></table></div>`;
   } catch (e) {
     $("detailOffers").innerHTML = `<span class="warn">${esc(e.message)}</span>`;
   }

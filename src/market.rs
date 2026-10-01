@@ -359,11 +359,16 @@ pub struct MarketTemplates {
     /// number of enclosed holes). Holes are a scale-independent cue that
     /// separates look-alikes such as `8` (two) from `3` (none).
     pub quantity_shapes: Vec<(u8, Vec<f32>, u32)>,
+    /// Chat-price confirmation digits (`{d}.{d}.png`). Drawn in the same font as
+    /// the market prices but at a different colour/scale, so they need their own
+    /// templates. Used by the buy path to verify the glowing item's price before
+    /// the right-click.
+    pub chat_digits: Vec<(u8, Template)>,
     /// `Buttons/Buy 1.png` — buy a single item.
     pub buy1: Option<Template>,
-    /// `Buttons/Buy X.png` — buy a stack, then type the amount.
+    /// `Buttons/Buy X.png` — buy a stack.
     pub buy_x: Option<Template>,
-    /// `Validations/Enter amount.png` — the chatbox prompt after Buy X.
+    /// `Validations/Enter amount.png` — the prompt that appears for a Buy X.
     pub enter_amount: Option<Template>,
 }
 
@@ -386,6 +391,18 @@ pub fn load_templates(sprites_dir: &Path) -> Result<MarketTemplates> {
         digits.push((d, tpl));
     }
 
+    // Chat confirmation digits are in the same folder but named `{d}.{d}.png`.
+    // They are optional for scanning prices, but required for chat verification
+    // in the buy path; load them best-effort and let callers fail explicitly if
+    // they try to use an empty set.
+    let mut chat_digits = Vec::with_capacity(10);
+    for d in 0..=9u8 {
+        let path = digits_dir.join(format!("{d}.{d}.png"));
+        if let Ok(tpl) = Template::load(&path) {
+            chat_digits.push((d, tpl));
+        }
+    }
+
     // Prefer sprites cropped from the COUNT font itself
     // (Sprites/Utility/Market count digits/0-9.png). It is a smaller font than the
     // price digits, and matching one against the other is only ~half reliable at
@@ -402,6 +419,7 @@ pub fn load_templates(sprites_dir: &Path) -> Result<MarketTemplates> {
         refresh,
         digits,
         quantity_shapes,
+        chat_digits,
         buy1: Template::load(&buttons.join("Buy 1.png")).ok(),
         buy_x: Template::load(&buttons.join("Buy X.png")).ok(),
         enter_amount: Template::load(&sprites_dir.join("Utility").join("Validations").join("Enter amount.png")).ok(),
@@ -753,9 +771,10 @@ pub fn merge_buttons(matches: &[MatchWithError], merge_px: i32) -> Vec<Match> {
     out
 }
 
-/// Read the price inside `band`. Greedy non-max suppression by error: the
-/// best-scoring candidate is accepted first and suppresses any candidate whose
-/// box overlaps it; survivors are sorted by x and concatenated.
+/// Read the price inside `band` using the market's digit glyphs.
+/// Greedy non-max suppression by error: the best-scoring candidate is accepted
+/// first and suppresses any candidate whose box overlaps it; survivors are
+/// sorted by x and concatenated.
 pub fn read_price(
     frame: &Frame,
     tpls: &MarketTemplates,
@@ -763,8 +782,19 @@ pub fn read_price(
     digit_tolerance: u8,
     overlap_ratio: f64,
 ) -> PriceRead {
+    read_price_with_digits(frame, &tpls.digits, band, digit_tolerance, overlap_ratio)
+}
+
+/// Generic price reader over any digit set.
+fn read_price_with_digits(
+    frame: &Frame,
+    digits: &[(u8, Template)],
+    band: Rect,
+    digit_tolerance: u8,
+    overlap_ratio: f64,
+) -> PriceRead {
     let mut candidates: Vec<DigitHit> = Vec::new();
-    for (value, tpl) in &tpls.digits {
+    for (value, tpl) in digits {
         for m in template::find_all_with_error(frame, tpl, band, digit_tolerance, 1) {
             candidates.push(DigitHit {
                 x: m.x,
@@ -801,6 +831,90 @@ pub fn read_price(
         chosen,
         candidates,
     }
+}
+
+/// Scan the chat box bottom-up in horizontal strips and return every price
+/// found, ordered from bottom (newest) to top (oldest). Notifications may push
+/// the price line upward; the caller should prefer the first entry.
+///
+/// Only the **rightmost digit cluster** of each strip is returned. The price is
+/// always the last number on the line ("currently costs X coins"), and digits
+/// earlier in the line — the "1" in "1 Hour", news killcounts, timestamps —
+/// would otherwise be concatenated into it or suppress its glyphs during NMS.
+/// A cluster is a run of chosen glyphs with no gap wider than `max_gap_px`;
+/// the rightmost run wins.
+pub fn read_chat_prices(
+    frame: &Frame,
+    tpls: &MarketTemplates,
+    band: Rect,
+    row_height: i32,
+    tolerance: u8,
+    overlap: f64,
+) -> Vec<(i32, u64)> {
+    read_chat_prices_with_gap(frame, tpls, band, row_height, tolerance, overlap, 24)
+}
+
+/// [`read_chat_prices`] with an explicit cluster gap (px). Exposed for tests.
+pub fn read_chat_prices_with_gap(
+    frame: &Frame,
+    tpls: &MarketTemplates,
+    band: Rect,
+    row_height: i32,
+    tolerance: u8,
+    overlap: f64,
+    max_gap_px: i32,
+) -> Vec<(i32, u64)> {
+    let mut out = Vec::new();
+    let bw = band.x2 - band.x1;
+    let bh = band.y2 - band.y1;
+    if bw <= 0 || bh <= 0 {
+        return out;
+    }
+
+    let mut y = band.y2;
+    while y - row_height >= band.y1 {
+        let strip = Rect {
+            x1: band.x1,
+            y1: y - row_height,
+            x2: band.x2,
+            y2: y,
+        };
+        let local = Rect {
+            x1: 0,
+            y1: strip.y1 - band.y1,
+            x2: bw,
+            y2: strip.y2 - band.y1,
+        };
+        let read = read_price_with_digits(frame, &tpls.chat_digits, local, tolerance, overlap);
+        if let Some(price) = rightmost_cluster(&read.chosen, max_gap_px) {
+            out.push((strip.y1, price));
+        }
+        y -= row_height;
+    }
+    out
+}
+
+/// The number formed by the rightmost run of glyphs with no internal gap wider
+/// than `max_gap_px`. Returns None when `chosen` is empty.
+fn rightmost_cluster(chosen: &[DigitHit], max_gap_px: i32) -> Option<u64> {
+    if chosen.is_empty() {
+        return None;
+    }
+    // `chosen` arrives sorted by x (see `read_price_with_digits`). Walk from the
+    // right until a gap wider than the cluster allows.
+    let mut start = chosen.len() - 1;
+    while start > 0 {
+        let gap = chosen[start].x - (chosen[start - 1].x + chosen[start - 1].w);
+        if gap > max_gap_px {
+            break;
+        }
+        start -= 1;
+    }
+    let mut price: u64 = 0;
+    for d in &chosen[start..] {
+        price = price * 10 + d.value as u64;
+    }
+    Some(price)
 }
 
 /// The text region for a button, in client coordinates.
@@ -1861,6 +1975,7 @@ mod tests {
             open: solid(4, 4, (1, 1, 1)),
             refresh: None,
             quantity_shapes: Vec::new(),
+            chat_digits: Vec::new(),
             buy1: None,
             buy_x: None,
             enter_amount: None,
@@ -1889,6 +2004,7 @@ mod tests {
             open: solid(4, 4, (1, 1, 1)),
             refresh: None,
             quantity_shapes: Vec::new(),
+            chat_digits: Vec::new(),
             buy1: None,
             buy_x: None,
             enter_amount: None,
@@ -1912,6 +2028,7 @@ mod tests {
             open: solid(4, 4, (1, 1, 1)),
             refresh: None,
             quantity_shapes: Vec::new(),
+            chat_digits: Vec::new(),
             buy1: None,
             buy_x: None,
             enter_amount: None,
@@ -1936,6 +2053,7 @@ mod tests {
             open: solid(32, 19, open_rgb),
             refresh: None,
             quantity_shapes: Vec::new(),
+            chat_digits: Vec::new(),
             buy1: None,
             buy_x: None,
             enter_amount: None,
@@ -1952,5 +2070,39 @@ mod tests {
         assert_eq!(res.rows.len(), 2, "two Open buttons");
         assert_eq!(res.rows[0].read.price, 50);
         assert_eq!(res.rows[1].read.price, 7);
+    }
+
+    fn hit(x: i32, w: i32, value: u8) -> DigitHit {
+        DigitHit { x, y: 0, w, h: 10, value, error: 0 }
+    }
+
+    #[test]
+    fn rightmost_cluster_ignores_leading_digits() {
+        // "1 Hour ... costs 9,000,000": the leading "1" sits 60px left of the
+        // price cluster. The rightmost run must be 9000000, not 19000000.
+        let chosen = vec![
+            hit(0, 8, 1),
+            hit(60, 9, 9),
+            hit(70, 9, 0),
+            hit(80, 9, 0),
+            hit(90, 9, 0),
+            hit(100, 9, 0),
+            hit(110, 9, 0),
+            hit(120, 9, 0),
+        ];
+        assert_eq!(rightmost_cluster(&chosen, 24), Some(9_000_000));
+    }
+
+    #[test]
+    fn rightmost_cluster_keeps_tight_price_digits() {
+        // Glyph advance ~10px: internal gaps of ~1px must not split the price.
+        let chosen =
+            vec![hit(60, 9, 9), hit(70, 9, 0), hit(80, 9, 0), hit(90, 9, 0)];
+        assert_eq!(rightmost_cluster(&chosen, 24), Some(9_000));
+    }
+
+    #[test]
+    fn rightmost_cluster_empty_is_none() {
+        assert_eq!(rightmost_cluster(&[], 24), None);
     }
 }

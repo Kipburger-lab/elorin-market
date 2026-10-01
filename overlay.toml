@@ -1,0 +1,30 @@
+# Elorin Bot — inventory slot overlay configuration.
+# Focus the Elorin client to show the magenta slot grid, nudge it with [ and ]
+# until it is pixel-perfect, then press S in-game to save.
+
+[window]
+# Substring matched (case-insensitive) against window titles. "Elorin - ..."
+# and a plain "Elorin" both match; non-game apps (VS Code/Discord/Brave/
+# terminals) are excluded by window class.
+title_contains = "Elorin"
+
+[grid]
+# Client-relative pixel grid for the 4x7 inventory. Seeded from the known-good
+# RuneLite measurements (Example scripts/inventory_slots_exact.txt); calibrate
+# to the Elorin client with the live hotkeys.
+#
+# Slot (col, row):
+#   x1 = base_x + col * step_x,  y1 = base_y + row * step_y
+#   x2 = x1 + slot_w,            y2 = y1 + slot_h
+base_x = 567
+base_y = 241
+cols = 4
+rows = 7
+slot_w = 35
+slot_h = 31
+step_x = 42
+step_y = 36
+
+[overlay]
+# Draw the on-screen parameter HUD (toggle in-game with H).
+show_hud = true

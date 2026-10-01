@@ -1,0 +1,58 @@
+[package]
+name = "elorin-bot"
+version = "0.1.0"
+edition = "2021"
+description = "Elorin Bot — local Win32 tooling. Screen-reading tools for the Elorin client."
+
+[lib]
+name = "elorin_bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inventory_overlay"
+path = "src/bin/inventory_overlay/main.rs"
+
+[[bin]]
+name = "market_scanner"
+path = "src/bin/market_scanner.rs"
+
+[dependencies]
+# Win32: window enumeration/identification, GDI screen capture + painting, low-level keyboard hook.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Com",
+    # Built-in Windows OCR (Windows.Media.Ocr) for item names.
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
+] }
+# PNG template decoding.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Parallel template scanning (all CPU threads).
+rayon = "1.10"
+# Config: tunable parameters + output schema.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Errors.
+anyhow = "1"
+# Shared state across the overlay thread and the hotkey hook.
+parking_lot = "0.12"
+# Blocking HTTPS client for the cloud push (rustls; no async runtime).
+ureq = "2"
+# Rolled logs next to the exe.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+[profile.release]
+opt-level = 3

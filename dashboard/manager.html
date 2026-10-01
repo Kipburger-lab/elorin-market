@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12100c">
+<meta name="robots" content="noindex, nofollow">
+<title>Elorin Buy Manager</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="manager.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand">Elorin <span>Buy Manager</span></div>
+    <nav class="nav">
+      <a href="index.html">Dashboard</a>
+      <a href="manager.html" class="active">Manager</a>
+    </nav>
+    <div class="auth" id="auth"></div>
+    <button id="reload" class="ghost" title="Reload">⟳</button>
+  </div>
+  <div class="status" id="status"></div>
+</header>
+
+<div id="gate" class="gate">
+  <div class="gateCard">
+    <div class="gateTitle">Private</div>
+    <p class="hint">Sign in to open the buy manager. The rules it holds are not
+      readable without this account.</p>
+    <input id="email" type="email" placeholder="email" autocomplete="username" spellcheck="false">
+    <input id="pw" type="password" placeholder="password" autocomplete="current-password">
+    <button class="ghost gateGo" id="signin">Sign in</button>
+    <div class="gateErr" id="gateErr"></div>
+  </div>
+</div>
+
+<main id="app" hidden>
+  <div class="banner" id="banner"></div>
+
+  <section class="panel">
+    <h2>Session rules
+      <span class="hint">a buy needs the master switch <em>and</em> the item ticked</span>
+    </h2>
+    <div class="rules" id="rules"></div>
+    <div class="hintline" id="rulesHint"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Items <span class="hint" id="count"></span></h2>
+    <div class="tools">
+      <input id="search" type="search" placeholder="Search items…" autocomplete="off" spellcheck="false">
+      <label><input type="checkbox" id="fOn"> enabled only</label>
+      <label><input type="checkbox" id="fProfit"> profitable only</label>
+      <label><input type="checkbox" id="fSnipe"> big snipes only</label>
+      <label>sort
+        <select id="sort" class="ghost">
+          <option value="n" selected>sightings</option>
+          <option value="profit">est. profit</option>
+          <option value="median">median price</option>
+          <option value="name">name</option>
+        </select>
+      </label>
+    </div>
+    <div class="tableWrap">
+      <table id="items" class="mtable">
+        <thead>
+          <tr>
+            <th>Buy</th>
+            <th>Item</th>
+            <th class="num">Max price</th>
+            <th class="num">Qty</th>
+            <th class="num">Bought</th>
+            <th class="num">Last</th>
+            <th class="num">p10</th>
+            <th class="num">Median</th>
+            <th class="num">Profit @ max</th>
+            <th>Spread</th>
+            <th class="num">Seen</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script src="config.js"></script>
+<script src="manager.js"></script>
+</body>
+</html>

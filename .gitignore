@@ -1,0 +1,5 @@
+/target
+/logs
+/data
+# market.toml holds the Supabase service key — keep it on this machine only.
+market.toml

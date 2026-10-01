@@ -14,6 +14,7 @@ const CFG = Object.assign({
 }, window.ELORIN_CONFIG || {});
 
 const AUTH_KEY = "elorin_manager_auth";
+const PRESETS_KEY = "elorin_manager_presets";
 
 const WINDOWS = {
   day:   { label: "Day",   ms: 24 * 3600e3,  bucket: "hour" },
@@ -307,6 +308,106 @@ function statusLine() {
   return `${state.items.length} items · ${done} enabled · master ${s && s.enabled ? "ON" : "off"}${when}`;
 }
 
+// ── Presets ───────────────────────────────────────────────────────────────
+function getPresets() {
+  try {
+    return JSON.parse(localStorage.getItem(PRESETS_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function setPresets(presets) {
+  localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
+}
+
+function currentPreset() {
+  return {
+    enabled: !!state.settings?.enabled,
+    min_margin: state.settings?.min_margin ?? 1e9,
+    max_snipes: state.settings?.max_snipes ?? 2,
+    rules: [...state.rules.values()].map(r => ({
+      name: r.name,
+      buy: !!r.buy,
+      max_price: r.max_price != null ? Number(r.max_price) : null,
+      qty_limit: r.qty_limit != null ? Number(r.qty_limit) : 1,
+    })),
+  };
+}
+
+function renderPresetSelect() {
+  const sel = $("presetSelect");
+  const presets = getPresets();
+  const current = sel.value;
+  sel.innerHTML = `<option value="">— choose a preset —</option>` +
+    Object.keys(presets).map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+  if (presets[current]) sel.value = current;
+}
+
+function showPresetStatus(msg, isErr) {
+  const el = $("presetStatus");
+  el.textContent = msg;
+  el.className = isErr ? "warn" : "hint";
+  setTimeout(() => { el.textContent = ""; el.className = "hint"; }, 3000);
+}
+
+function savePreset() {
+  const name = $("presetName").value.trim();
+  if (!name) { showPresetStatus("enter a preset name", true); return; }
+  const presets = getPresets();
+  presets[name] = currentPreset();
+  setPresets(presets);
+  renderPresetSelect();
+  $("presetSelect").value = name;
+  showPresetStatus("saved");
+}
+
+function loadPreset() {
+  const name = $("presetSelect").value;
+  if (!name) { showPresetStatus("choose a preset first", true); return; }
+  const presets = getPresets();
+  const p = presets[name];
+  if (!p) { showPresetStatus("preset not found", true); return; }
+
+  if (p.settings) {
+    state.settings.enabled = !!p.settings.enabled;
+    state.settings.min_margin = p.settings.min_margin ?? 1e9;
+    state.settings.max_snipes = p.settings.max_snipes ?? 2;
+  } else {
+    state.settings.enabled = !!p.enabled;
+    state.settings.min_margin = p.min_margin ?? 1e9;
+    state.settings.max_snipes = p.max_snipes ?? 2;
+  }
+  saveSettings();
+
+  (p.rules || []).forEach(r => {
+    state.rules.set(r.name, {
+      name: r.name,
+      buy: !!r.buy,
+      max_price: r.max_price != null ? Number(r.max_price) : null,
+      qty_limit: r.qty_limit != null ? Number(r.qty_limit) : 1,
+      bought: 0,
+    });
+    saveRow(r.name);
+  });
+
+  renderRules();
+  renderBanner();
+  renderItems();
+  showPresetStatus("loaded");
+}
+
+function deletePreset() {
+  const name = $("presetSelect").value;
+  if (!name) { showPresetStatus("choose a preset first", true); return; }
+  const presets = getPresets();
+  delete presets[name];
+  setPresets(presets);
+  renderPresetSelect();
+  $("presetName").value = "";
+  showPresetStatus("deleted");
+}
+
 // ── Load ──────────────────────────────────────────────────────────────────
 async function load() {
   if (!CFG.supabaseUrl || CFG.supabaseUrl.includes("YOUR-PROJECT")) {
@@ -378,6 +479,7 @@ function showApp() {
   $("app").hidden = false;
   renderAuth();
   renderBanner();
+  renderPresetSelect();
 }
 
 function wireGate() {
@@ -738,6 +840,9 @@ $("fProfit").addEventListener("change", e => { state.filters.profit = e.target.c
 $("fSnipe").addEventListener("change", e => { state.filters.snipe = e.target.checked; state.shown = PAGE; renderItems(); });
 $("sort").addEventListener("change", e => { state.sort = e.target.value; state.shown = PAGE; renderItems(); });
 $("reload").addEventListener("click", load);
+$("presetSave").addEventListener("click", savePreset);
+$("presetLoad").addEventListener("click", loadPreset);
+$("presetDelete").addEventListener("click", deletePreset);
 
 // ── Boot ──────────────────────────────────────────────────────────────────
 loadAuth();

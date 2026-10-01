@@ -172,3 +172,26 @@
 
 .hintline { color: var(--dim); font-size: 12px; margin: 6px 0 10px; }
 .warnbox { color: var(--red); font-size: 12px; }
+
+/* ── presets ─────────────────────────────────────────────────────────── */
+.presets {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+}
+.presets select, .presets input[type="text"] {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 7px;
+  font: inherit;
+}
+.presets select { min-width: 160px; }
+.presets input[type="text"] { min-width: 130px; }
+.presets button.warn { color: var(--red); border-color: var(--red); }

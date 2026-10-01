@@ -47,6 +47,22 @@
   </section>
 
   <section class="panel">
+    <h2>Presets
+      <span class="hint">save or load a complete buy setup</span>
+    </h2>
+    <div class="presets">
+      <select id="presetSelect" class="ghost">
+        <option value="">— choose a preset —</option>
+      </select>
+      <input id="presetName" type="text" placeholder="preset name" spellcheck="false">
+      <button id="presetSave" class="ghost">Save current</button>
+      <button id="presetLoad" class="ghost">Load</button>
+      <button id="presetDelete" class="ghost warn">Delete</button>
+      <span id="presetStatus" class="hint"></span>
+    </div>
+  </section>
+
+  <section class="panel">
     <h2>Items <span class="hint" id="count"></span></h2>
     <div class="tools">
       <input id="search" type="search" placeholder="Search items…" autocomplete="off" spellcheck="false">

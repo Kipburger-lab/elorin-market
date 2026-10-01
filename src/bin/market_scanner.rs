@@ -310,6 +310,7 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
             &app.tpls,
             &app.cfg.icon,
             &app.cfg.buy,
+            app.ocr.as_ref(),
         );
         println!("  {}", outcome.describe());
         info!(outcome = %outcome.describe(), "auto-buy");

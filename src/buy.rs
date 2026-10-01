@@ -817,7 +817,14 @@ fn all_blobs(mask: &[bool], w: i32, h: i32) -> Vec<Vec<usize>> {
 
 /// The biggest blob that could plausibly be a single item: enough ink, not so
 /// large that it's part of the panel furniture.
-fn largest_item_blob(mask: &[bool], w: i32, h: i32, cfg: &BuyConfig) -> Option<Vec<usize>> {
+fn largest_item_blob(
+    mask: &[bool],
+    w: i32,
+    h: i32,
+    cfg: &BuyConfig,
+    x_off: i32,
+    y_off: i32,
+) -> Option<Vec<usize>> {
     let min_ink = cfg.glow_min_px.max(1) as usize;
     let max_side = cfg.glow_max_size.max(8);
     all_blobs(mask, w, h).into_iter().find(|b| {
@@ -827,6 +834,13 @@ fn largest_item_blob(mask: &[bool], w: i32, h: i32, cfg: &BuyConfig) -> Option<V
         let (x1, y1, x2, y2) = blob_bbox(b, w);
         let (bw, bh) = (x2 - x1 + 1, y2 - y1 + 1);
         if bw > max_side || bh > max_side {
+            return false;
+        }
+        // Skip a spot the menu already proved wrong, so the next attempt tries
+        // the next candidate rather than the same wrong item again. The mask is
+        // in frame coordinates once the offset is added back.
+        let here = Match { x: x1 + x_off, y: y1 + y_off, w: bw, h: bh };
+        if is_rejected(here) {
             return false;
         }
         (b.len() as f32 / (bw * bh) as f32) <= cfg.glow_max_fill
@@ -881,6 +895,49 @@ fn keep_largest_component(mask: &mut [bool], w: i32, h: i32) {
             *m = false;
         }
     }
+}
+
+/// Glow candidates the menu refused, so the next attempt looks elsewhere.
+///
+/// When the menu's label doesn't refer to the item we came for, that spot is
+/// wrong — a look-alike or a yellow neighbour beat the real glow. The purchase
+/// then aborts, the loop rescans and comes back to the same offer, and this is
+/// what makes that next attempt skip the spot already proven wrong and try the
+/// next candidate instead. Entries expire, so a stale rejection from an earlier
+/// visit cannot block a later one.
+static GLOW_REJECTED: std::sync::OnceLock<std::sync::Mutex<Vec<(std::time::Instant, Match)>>> =
+    std::sync::OnceLock::new();
+
+fn glow_rejected() -> &'static std::sync::Mutex<Vec<(std::time::Instant, Match)>> {
+    GLOW_REJECTED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Reject a spot for a while (see [`GLOW_REJECTED`]).
+///
+/// The expiry has to outlast working through a shop that holds several wrong
+/// items: one rejected spot is retried per pass, and a shop with half a dozen
+/// Bonds takes half a dozen passes. Too short and an early rejection lapses
+/// while later ones are being tried, so the first Bond becomes a candidate
+/// again and the sequence never terminates.
+fn reject_glow(m: &Match) {
+    let mut list = glow_rejected().lock().unwrap();
+    list.retain(|(t, _)| t.elapsed() < Duration::from_secs(300));
+    list.push((std::time::Instant::now(), *m));
+}
+
+/// Was this blob already refused by the menu?
+fn is_rejected(m: Match) -> bool {
+    let mut list = glow_rejected().lock().unwrap();
+    list.retain(|(t, _)| t.elapsed() < Duration::from_secs(300));
+    list.iter().any(|(_, r)| overlaps(*r, m))
+}
+
+/// How many spots are currently refused. Bounds the in-shop retry: each attempt
+/// rejects one, so the count rising is the retry making progress.
+fn rejected_count() -> usize {
+    let mut list = glow_rejected().lock().unwrap();
+    list.retain(|(t, _)| t.elapsed() < Duration::from_secs(300));
+    list.len()
 }
 
 /// Is this pixel part of the item's glow? See [`BuyConfig::glow_yellowness`].
@@ -944,7 +1001,7 @@ fn find_glow(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Option<Match> {
         }
     }
 
-    let blob = largest_item_blob(&joined, w, h, cfg)?;
+    let blob = largest_item_blob(&joined, w, h, cfg, x1, y1)?;
     let (bx1, by1, bx2, by2) = blob_bbox(&blob, w);
     Some(Match {
         x: x1 + bx1,
@@ -1186,6 +1243,115 @@ pub fn return_to_offers(
     }
 }
 
+/// Render a region as black text on white, enlarged, for the OCR.
+///
+/// Handed raw pixels the engine returns nothing at all for the menu — pale text
+/// on a dark panel reads as empty — and an empty read is how a Bond got bought.
+/// The market's name reader gets away with raw pixels because its rows are
+/// already high-contrast; this thresholds, pads and enlarges the same way it
+/// does so the menu is legible to the engine too.
+fn render_for_ocr(frame: &Frame, rect: Rect, scale: i32, pad: i32) -> (i32, i32, Vec<u8>) {
+    let w = (rect.x2 - rect.x1).max(1);
+    let h = (rect.y2 - rect.y1).max(1);
+    let s = scale.max(1);
+    let (ow, oh) = ((w + 2 * pad) * s, (h + 2 * pad) * s);
+
+    let mut out = vec![255u8; (ow * oh * 4) as usize];
+    for y in 0..oh {
+        for x in 0..ow {
+            let sx = rect.x1 + x / s - pad;
+            let sy = rect.y1 + y / s - pad;
+            let is_text = frame
+                .pixel(sx, sy)
+                .map(|p| (p[0] as u32 + p[1] as u32 + p[2] as u32) > 330)
+                .unwrap_or(false);
+            let v = if is_text { 0u8 } else { 255u8 };
+            let o = ((y * ow + x) * 4) as usize;
+            out[o] = v;
+            out[o + 1] = v;
+            out[o + 2] = v;
+            out[o + 3] = 255;
+        }
+    }
+    (ow, oh, out)
+}
+
+/// Letters and digits only, lowercased — so case, punctuation and the game's
+/// odd glyphs cannot matter.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// The plain edit distance between two strings — both ends anchored.
+///
+/// Anchored deliberately. An earlier version left the ends free to find the
+/// best-matching run, which let a short tail decide everything: `Amulet of fury`
+/// passed against `Amulet of glory` because `ury` is one edit from `ory`. Names
+/// have to be compared whole.
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j - 1] + sub).min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Does a menu label refer to the item we meant to buy? Works for any item.
+///
+/// Compares whatever the menu said against whatever name the watchlist used, by
+/// **percentage rather than spelling**, because two things are routinely wrong:
+///
+/// * The market truncates long names — it shows `Barrows - ahrim...` where the
+///   menu spells out `Barrows - ahrim's staff` — so the expected name is allowed
+///   to be a near-exact opening of the read.
+/// * The OCR misreads individual glyphs: it renders `Larran's key` as
+///   `Larran 5 key`, reading the apostrophe as a five.
+///
+/// Up to a fifth of the shorter name may differ. Edit distance rather than
+/// character equality, because an insertion shifts everything after it and an
+/// equality check cannot survive that. A fifth rather than a quarter because at
+/// a quarter `Amulet of fury` matches `Amulet of glory` — both real, different,
+/// and three million apart.
+///
+/// Limitation worth knowing: if the *watchlist* name was itself mangled by the
+/// market's OCR (the dump has `SanguinesEi sta..` and `fivernic defende..`), no
+/// sane tolerance will match it against the true name the menu shows. Those
+/// entries need correcting in the manager rather than loosening this.
+///
+/// A read that produced nothing is a mismatch, not permission: refusing costs a
+/// missed snipe, buying the wrong item costs whatever that item is worth.
+fn menu_label_matches(label: &str, expected: &str) -> bool {
+    let read: Vec<char> = squash(label).chars().collect();
+    let want: Vec<char> = squash(expected).chars().collect();
+    if read.is_empty() || want.is_empty() {
+        return false;
+    }
+    let (short, long) = if read.len() <= want.len() { (&read, &want) } else { (&want, &read) };
+    let allowed = (short.len() / 5).max(1);
+
+    // The truncated case — but only when the read is *meaningfully* longer, so
+    // this path is reserved for real truncation. Names of near-equal length that
+    // differ in their tail (`Amulet of fury` / `Amulet of glory`) fall through to
+    // the full comparison, where they fail as they should.
+    if long.len() > short.len() + allowed {
+        let prefix_mismatches = short.iter().zip(long.iter()).filter(|(a, b)| a != b).count();
+        if prefix_mismatches <= allowed {
+            return true;
+        }
+    }
+    // Otherwise both names are present in full and must be close throughout.
+    edit_distance(short, long) <= allowed
+}
+
 /// Append one line to `data/purchases.jsonl`.
 ///
 /// The scanner runs unattended, so this is the only way to review what it did —
@@ -1237,9 +1403,12 @@ pub fn execute(
     tpls: &MarketTemplates,
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
+    ocr: Option<&crate::ocr::Ocr>,
 ) -> Outcome {
     let tag = crate::market::now_ms().to_string();
-    let outcome = execute_inner(exe_dir, hwnd, cap, frame, row, verdict, tpls, icon_cfg, cfg, &tag);
+    let outcome = execute_inner(
+        exe_dir, hwnd, cap, frame, row, verdict, tpls, icon_cfg, cfg, &tag, ocr,
+    );
     log_attempt(exe_dir, &tag, &row.name, verdict.price, &outcome);
     outcome
 }
@@ -1256,6 +1425,7 @@ fn execute_inner(
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
     tag: &str,
+    ocr: Option<&crate::ocr::Ocr>,
 ) -> Outcome {
     let name = row.name.clone();
     let shot = |stage: &str, f: &Frame| save_debug(exe_dir, &cfg.debug_dir, tag, stage, f);
@@ -1438,6 +1608,55 @@ fn execute_inner(
                 return Outcome::Failed(format!("{label} disappeared before the click"));
             };
             let (bx, by) = bm.center();
+            // Read the menu's own label for this entry and require it to refer to
+            // the item we came for. The glow narrows to a candidate; the game's
+            // own text is what confirms it, and it is the only signal here that
+            // is *stated* rather than inferred from colours — so a look-alike, or
+            // a yellow neighbour that out-sized the glow, cannot be bought.
+            if let Some(engine) = ocr {
+                let rect = Rect {
+                    x1: bm.x + bm.w,
+                    y1: bm.y,
+                    x2: (bm.x + bm.w + 220).min(menu_frame.width),
+                    y2: bm.y + bm.h,
+                };
+                if rect.x2 - rect.x1 > 8 && rect.y2 - rect.y1 > 4 {
+                    let (w, h, buf) = render_for_ocr(&menu_frame, rect, 3, 8);
+                    let read = engine
+                        .recognize_bgra(w, h, &buf)
+                        .map(|t| t.trim().to_string())
+                        .unwrap_or_else(|e| {
+                            warn!(error = %e, "buy: the menu OCR call failed");
+                            String::new()
+                        });
+                    if menu_label_matches(&read, &name) {
+                        info!(menu = %read, expected = %name, "buy: menu confirms the item");
+                    } else {
+                        // Not our item. Move the pointer off it so the menu goes
+                        // away, remember the spot, and look for the next candidate
+                        // in *this* shop — re-running the purchase re-runs the item
+                        // search, which now skips this spot. No trip back to the
+                        // offers list, and no clicking anything here.
+                        crate::input::recover();
+                        reject_glow(&m);
+                        const MAX_CANDIDATES: usize = 8;
+                        if rejected_count() < MAX_CANDIDATES {
+                            info!(
+                                read = %read,
+                                expected = %name,
+                                "buy: wrong item in this shop — trying the next candidate"
+                            );
+                            return execute_inner(
+                                exe_dir, hwnd, cap, frame, row, verdict, tpls, icon_cfg, cfg, tag,
+                                ocr,
+                            );
+                        }
+                        return Outcome::Failed(format!(
+                            "the menu reads \"{read}\", not {name} — no other candidate in this shop"
+                        ));
+                    }
+                }
+            }
             let Some((bsx, bsy)) = (unsafe { crate::window::client_to_screen(hwnd, bx, by) }) else {
                 return Outcome::Failed("client_to_screen failed for the buy button".into());
             };
@@ -1913,6 +2132,34 @@ mod tests {
         assert!(!is_glow_pixel(&px(60, 180, 40), &cfg), "olive green must not pass");
         assert!(!is_glow_pixel(&px(90, 75, 50), &cfg), "the panel must not pass");
         assert!(!is_glow_pixel(&px(220, 30, 30), &cfg), "a red must not pass");
+    }
+
+    /// Universal, not key-specific: any watchlist name against any menu read.
+    /// The cases that matter are the truncated market name, the OCR's glyph
+    /// misreads, and telling two similar items apart.
+    #[test]
+    fn names_match_by_percentage_not_spelling() {
+        // Market names are truncated; the menu spells them out.
+        assert!(menu_label_matches("Barrows - ahrim's staff", "Barrows - ahrim..."));
+        assert!(menu_label_matches("Armadyl godsword", "armadyl godswor..."));
+        assert!(menu_label_matches("Pegasian boots", "Pegasian boots"));
+
+        // Case and punctuation are noise.
+        assert!(menu_label_matches("LARRANS KEY", "Larran's key"));
+        // The live misread: the OCR renders the apostrophe as a five.
+        assert!(menu_label_matches("Larran 5 key", "Larran's key"));
+        // An insertion must not shift the rest into failure.
+        assert!(menu_label_matches("Pegasian bootss", "Pegasian boots"));
+
+        // Similar items must still be told apart.
+        assert!(!menu_label_matches("Zuriel's hood", "Zuriel's robe top"));
+        assert!(!menu_label_matches("Bond", "Larran's key"));
+        assert!(!menu_label_matches("$100 Bond", "Larran's key"));
+        assert!(!menu_label_matches("Amulet of fury", "Amulet of glory"));
+
+        // An unreadable menu refuses rather than permits.
+        assert!(!menu_label_matches("", "Larran's key"));
+        assert!(!menu_label_matches("....", "Larran's key"));
     }
 
     /// The glow pulses, and an absolute-brightness test missed it whenever the

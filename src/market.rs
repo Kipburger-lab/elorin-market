@@ -49,6 +49,9 @@ pub struct MarketConfig {
     /// Optional auto-buy controller (reads the rules the manager writes).
     #[serde(default)]
     pub buy: crate::buy::BuyConfig,
+    /// Optional Discord webhook notifications for purchases / stuck states.
+    #[serde(default)]
+    pub discord: crate::discord::DiscordConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -331,6 +334,7 @@ impl MarketConfig {
             refresh: RefreshCfg::default(),
             cloud: crate::cloud::CloudConfig::default(),
             buy: crate::buy::BuyConfig::default(),
+            discord: crate::discord::DiscordConfig::default(),
             output: OutputCfg {
                 file: "data/market_prices.json".to_string(),
                 history: "data/market_history.jsonl".to_string(),

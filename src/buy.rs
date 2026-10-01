@@ -1237,9 +1237,27 @@ pub fn execute(
     tpls: &MarketTemplates,
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
+    discord_cfg: &crate::discord::DiscordConfig,
 ) -> Outcome {
     let tag = crate::market::now_ms().to_string();
     let outcome = execute_inner(exe_dir, hwnd, cap, frame, row, verdict, tpls, icon_cfg, cfg, &tag);
+    if let Outcome::Bought { units, .. } = outcome {
+        if discord_cfg.is_configured() {
+            let icon_png = crate::market::crop_icon(frame, &row.open, icon_cfg)
+                .and_then(|(w, h, rgba)| crate::discord::encode_icon_png(w, h, &rgba));
+            crate::discord::notify_purchase(
+                discord_cfg.clone(),
+                verdict.name.clone(),
+                row.seller.clone(),
+                verdict.price,
+                units as i64,
+                verdict.profit,
+                verdict.pct,
+                verdict.snipe,
+                icon_png,
+            );
+        }
+    }
     log_attempt(exe_dir, &tag, &row.name, verdict.price, &outcome);
     outcome
 }

@@ -12,6 +12,7 @@
 pub mod buy;
 pub mod capture;
 pub mod cloud;
+pub mod discord;
 pub mod hotkeys;
 pub mod input;
 pub mod market;

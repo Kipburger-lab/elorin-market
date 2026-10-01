@@ -310,6 +310,7 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
             &app.tpls,
             &app.cfg.icon,
             &app.cfg.buy,
+            &app.cfg.discord,
         );
         println!("  {}", outcome.describe());
         info!(outcome = %outcome.describe(), "auto-buy");
@@ -399,12 +400,12 @@ fn encode_with_ffmpeg(dir: &Path, tag: u128) -> bool {
 /// Only frames that differ from the previous one are written: in a stuck state
 /// most are identical, and repeated copies are pure waste. They are then folded
 /// into a single small MP4 when ffmpeg is available.
-fn record_client(cap: &GdiCapturer, exe_dir: &Path, seconds: u64, title_contains: &str) {
+fn record_client(cap: &GdiCapturer, exe_dir: &Path, seconds: u64, title_contains: &str) -> Option<PathBuf> {
     let tag = market::now_ms();
     let dir = exe_dir.join("data").join("stuck").join(tag.to_string());
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(error = %e, "could not create the stuck recording dir");
-        return;
+        return None;
     }
 
     const FPS: u64 = 4;
@@ -451,8 +452,11 @@ fn record_client(cap: &GdiCapturer, exe_dir: &Path, seconds: u64, title_contains
         );
     }
     if saved > 1 {
-        encode_with_ffmpeg(&dir, tag);
+        if encode_with_ffmpeg(&dir, tag) {
+            return Some(dir.join(format!("{tag}.mp4")));
+        }
     }
+    None
 }
 
 fn loop_thread() {
@@ -552,7 +556,8 @@ fn loop_thread() {
                 // per episode, not on every pass.
                 stuck += 1;
                 if stuck == STUCK_AFTER {
-                    record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
+                    let video = record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
+                    elorin_bot::discord::notify_stuck(app.cfg.discord.clone(), video);
                     stuck = 0;
                 }
                 std::thread::sleep(Duration::from_millis(300));

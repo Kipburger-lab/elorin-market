@@ -49,8 +49,18 @@
 
 .gateErr { color: var(--red); font-size: 12px; min-height: 15px; }
 
-/* ── auth bar (once inside) ─────────────────────────────────────────── */
+/* ── sign-in bar (once inside) ──────────────────────────────────────── */
 .auth { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.auth input {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 5px 8px;
+  font: inherit;
+  width: 150px;
+}
 
 .auth .who { color: var(--green); font-size: 12px; }
 .auth .none { color: var(--dim); font-size: 12px; }

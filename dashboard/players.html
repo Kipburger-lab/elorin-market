@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12100c">
+<title>Elorin Market — Players</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand">Elorin <span>Market</span></div>
+    <nav class="nav">
+      <a href="index.html">Dashboard</a>
+      <a href="players.html" class="active">Players</a>
+    </nav>
+    <input id="search" type="search" placeholder="Search player…" autocomplete="off" spellcheck="false">
+    <button id="reload" class="ghost" title="Reload">⟳</button>
+  </div>
+  <div class="status" id="status">loading…</div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Players <span class="hint" id="playersHint"></span></h2>
+    <div class="tableWrap">
+      <table id="players">
+        <thead>
+          <tr>
+            <th>Player</th>
+            <th class="num">Offers</th>
+            <th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="playersBody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="detail" class="modal hidden" aria-hidden="true">
+  <div class="sheet" id="detailSheet"></div>
+</div>
+
+<script src="config.js"></script>
+<script src="players.js"></script>
+</body>
+</html>

@@ -142,24 +142,6 @@ pub struct BuyConfig {
     /// Fraction of the icon's top-left corner to ignore (a quantity badge sits
     /// there in the shop, and in the market when the stack is > 1).
     pub icon_corner_pct: f32,
-    /// Chat-price verification before right-clicking the glowing item.
-    /// When enabled, the buy path left-clicks the item a few times, reads the
-    /// price the game prints in the chat box, and only proceeds if the bottom
-    /// (newest) price matches the market row's price.
-    pub chat_verify: bool,
-    /// Chat box area in fixed-mode RuneLite, in client coordinates.
-    pub chat_band: [i32; 4],
-    /// Height of one chat line; the box is scanned bottom-up in these strips.
-    pub chat_row_height: i32,
-    /// Per-channel pixel tolerance for matching the chat digit glyphs.
-    pub chat_tolerance: u8,
-    /// Two chat digit candidates whose boxes overlap by more than this fraction
-    /// are treated as the same glyph.
-    pub chat_overlap: f64,
-    /// How long to keep scanning the chat after the first left-click, in ms.
-    /// Price messages can be delayed by game notifications, so this window is
-    /// deliberately generous; the scan stops early as soon as a match is found.
-    pub chat_scan_max_ms: u64,
 }
 
 impl Default for BuyConfig {
@@ -201,12 +183,6 @@ impl Default for BuyConfig {
             require_menu_pair: true,
             icon_erode_px: 2,
             icon_corner_pct: 0.45,
-            chat_verify: true,
-            chat_band: [7, 345, 516, 498],
-            chat_row_height: 18,
-            chat_tolerance: 30,
-            chat_overlap: 0.5,
-            chat_scan_max_ms: 2500,
         }
     }
 }
@@ -857,29 +833,6 @@ fn largest_item_blob(mask: &[bool], w: i32, h: i32, cfg: &BuyConfig) -> Option<V
     })
 }
 
-/// Every blob that could plausibly be a single glowing item, largest first.
-/// Same size/ink gate as [`largest_item_blob`], but returns all candidates so
-/// the caller can chat-verify each in turn rather than aborting on the first
-/// mismatch.
-fn all_item_blobs(mask: &[bool], w: i32, h: i32, cfg: &BuyConfig) -> Vec<Vec<usize>> {
-    let min_ink = cfg.glow_min_px.max(1) as usize;
-    let max_side = cfg.glow_max_size.max(8);
-    all_blobs(mask, w, h)
-        .into_iter()
-        .filter(|b| {
-            if b.len() < min_ink {
-                return false;
-            }
-            let (x1, y1, x2, y2) = blob_bbox(b, w);
-            let (bw, bh) = (x2 - x1 + 1, y2 - y1 + 1);
-            if bw > max_side || bh > max_side {
-                return false;
-            }
-            (b.len() as f32 / (bw * bh) as f32) <= cfg.glow_max_fill
-        })
-        .collect()
-}
-
 /// The bounding box of the largest 4-connected blob of `mask`.
 fn largest_blob(mask: &[bool], w: i32, h: i32) -> Vec<usize> {
     let n = (w * h) as usize;
@@ -943,146 +896,6 @@ fn is_glow_pixel(p: &[u8], cfg: &BuyConfig) -> bool {
         && (g - b) > cfg.glow_green_min
 }
 
-/// Verify the glowing item by making the game print its price in the chat box.
-/// Left-clicks the item 5 times with ~50 ms jitter, then polls the chat box
-/// from 75 ms after the first click up to 1000 ms total, reading it bottom-up.
-/// Returns Ok if the newest (bottom-most) price matches `expected`, otherwise
-/// Err with a diagnostic message. This catches the wrong item glowing (e.g. a
-/// Bond next to a key) or a price that changed after the market scan.
-fn verify_chat_price(
-    hwnd: HWND,
-    cap: &GdiCapturer,
-    tpls: &MarketTemplates,
-    cfg: &BuyConfig,
-    expected: i64,
-    item_client: (i32, i32),
-    tag: &str,
-    exe_dir: &Path,
-) -> Result<(), String> {
-    if !cfg.chat_verify {
-        return Ok(());
-    }
-    if tpls.chat_digits.len() < 10 {
-        return Err("chat digit templates incomplete; skipping verification".into());
-    }
-
-    let (ix, iy) = item_client;
-    let Some((sx, sy)) = (unsafe { crate::window::client_to_screen(hwnd, ix, iy) }) else {
-        return Err("client_to_screen failed for chat verify click".into());
-    };
-
-    let band = Rect {
-        x1: cfg.chat_band[0],
-        y1: cfg.chat_band[1],
-        x2: cfg.chat_band[2],
-        y2: cfg.chat_band[3],
-    };
-
-    // 1. Baseline: read the chat *before* clicking. Old price messages from
-    //    previous items or previous attempts must not be mistaken for the new
-    //    item's price.
-    let baseline: Vec<u64> = cap
-        .capture_region(band)
-        .map(|frame| {
-            crate::market::read_chat_prices(
-                &frame,
-                tpls,
-                band,
-                cfg.chat_row_height,
-                cfg.chat_tolerance,
-                cfg.chat_overlap,
-            )
-            .into_iter()
-            .map(|(_, price)| price)
-            .collect()
-        })
-        .unwrap_or_default();
-
-    // 2. Click the item 5 times, ~50 ms apart with light jitter. Start scanning
-    //    immediately after the first click — no 75 ms head start.
-    let first_click = Instant::now();
-    for i in 0..5 {
-        crate::input::click_screen_keep(sx, sy);
-        let base = if i == 4 { 0 } else { 50 };
-        if base > 0 {
-            // No rand crate needed: use sub-millisecond time as cheap entropy.
-            let jitter = (Instant::now().elapsed().as_nanos() as u64) % 21;
-            std::thread::sleep(Duration::from_millis(base + jitter));
-        }
-    }
-
-    let deadline = first_click + Duration::from_millis(cfg.chat_scan_max_ms);
-    let mut last_chat_frame: Option<Frame> = None;
-    let mut last_new_prices: Vec<(i32, u64)> = Vec::new();
-    let mut scans: u64 = 0;
-    let mut last_report = Instant::now();
-
-    while Instant::now() < deadline {
-        if let Ok(frame) = cap.capture_region(band) {
-            scans += 1;
-            let prices = crate::market::read_chat_prices(
-                &frame,
-                tpls,
-                band,
-                cfg.chat_row_height,
-                cfg.chat_tolerance,
-                cfg.chat_overlap,
-            );
-            last_chat_frame = Some(frame);
-
-            // The bottom-most price that was NOT present before the click is the
-            // one belonging to the item we just clicked.
-            let new_price = prices
-                .iter()
-                .find(|(_, price)| !baseline.contains(price))
-                .copied();
-
-            if let Some((y, price)) = new_price {
-                last_new_prices = prices
-                    .into_iter()
-                    .filter(|(_, price)| !baseline.contains(price))
-                    .collect();
-                let price_i64 = price as i64;
-                let elapsed = first_click.elapsed().as_millis();
-                info!(
-                    scans,
-                    price = price_i64,
-                    y,
-                    elapsed_ms = elapsed,
-                    "buy: new chat price found"
-                );
-                if price_i64 == expected {
-                    return Ok(());
-                }
-                if let Some(f) = last_chat_frame.as_ref() {
-                    save_debug(exe_dir, &cfg.debug_dir, tag, "chat_mismatch", f);
-                }
-                return Err(format!(
-                    "chat price mismatch after {elapsed} ms: expected {expected}, got {price_i64} at y={y}"
-                ));
-            }
-        }
-        if last_report.elapsed() >= Duration::from_millis(100) {
-            debug!(scans_per_100ms = scans, "buy: chat scan rate");
-            scans = 0;
-            last_report = Instant::now();
-        }
-    }
-
-    if let Some(f) = last_chat_frame.as_ref() {
-        save_debug(exe_dir, &cfg.debug_dir, tag, "chat_timeout", f);
-    }
-    let elapsed = first_click.elapsed().as_millis();
-    info!(total_scans = scans, elapsed_ms = elapsed, "buy: chat verification ended");
-    if last_new_prices.is_empty() {
-        Err(format!("chat price not found within {elapsed} ms ({scans} scans)"))
-    } else {
-        Err(format!(
-            "chat prices seen but none matched after {elapsed} ms ({scans} scans): {last_new_prices:?}"
-        ))
-    }
-}
-
 /// Find the item the shop is highlighting.
 ///
 /// The game wraps the item you searched for in a glowing yellow marker, and that
@@ -1139,64 +952,6 @@ fn find_glow(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Option<Match> {
         w: bx2 - bx1 + 1,
         h: by2 - by1 + 1,
     })
-}
-
-/// Every item-sized glow blob in the region, largest first.
-///
-/// Same pipeline as [`find_glow`] (glow mask + 2px join), but returns all
-/// candidates so a failed chat verification can move on to the next glowing
-/// item instead of aborting the whole purchase.
-fn find_glows(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Vec<Match> {
-    let x1 = rect.x1.max(0).min(frame.width);
-    let y1 = rect.y1.max(0).min(frame.height);
-    let x2 = rect.x2.max(0).min(frame.width);
-    let y2 = rect.y2.max(0).min(frame.height);
-    let (w, h) = (x2 - x1, y2 - y1);
-    if w <= 0 || h <= 0 {
-        return Vec::new();
-    }
-
-    let mut mask = vec![false; (w * h) as usize];
-    for y in y1..y2 {
-        for x in x1..x2 {
-            if let Some(p) = frame.pixel(x, y) {
-                if is_glow_pixel(&p, cfg) {
-                    mask[((y - y1) * w + (x - x1)) as usize] = true;
-                }
-            }
-        }
-    }
-
-    let join = 2i32;
-    let mut joined = mask.clone();
-    for y in 0..h {
-        for x in 0..w {
-            if !mask[(y * w + x) as usize] {
-                continue;
-            }
-            for dy in -join..=join {
-                for dx in -join..=join {
-                    let (nx, ny) = (x + dx, y + dy);
-                    if nx >= 0 && ny >= 0 && nx < w && ny < h {
-                        joined[(ny * w + nx) as usize] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    all_item_blobs(&joined, w, h, cfg)
-        .into_iter()
-        .map(|blob| {
-            let (bx1, by1, bx2, by2) = blob_bbox(&blob, w);
-            Match {
-                x: x1 + bx1,
-                y: y1 + by1,
-                w: bx2 - bx1 + 1,
-                h: by2 - by1 + 1,
-            }
-        })
-        .collect()
 }
 
 /// Capture repeatedly until `pred` accepts a frame, or `timeout_ms` elapses.
@@ -1596,49 +1351,11 @@ fn execute_inner(
             }
         }
     };
-
-    // 4. Every glowing candidate, largest first. A failed chat verification
-    //    moves on to the next glowing item — the glow can sit on the wrong item
-    //    (a bond next to a key), so the first candidate isn't trusted. Only
-    //    when every candidate fails do we go back to the offers list.
-    let mut candidates = vec![m];
-    for c in find_glows(&shop, glow_area, cfg) {
-        if !candidates.iter().any(|seen| overlaps(*seen, c)) {
-            candidates.push(c);
-        }
-    }
-    info!(n = candidates.len(), "buy: glow candidates to verify");
-
-    let mut failures: Vec<String> = Vec::new();
-    let mut m = None;
-    for (i, cand) in candidates.iter().enumerate() {
-        let (ix, iy) = cand.center();
-        match verify_chat_price(hwnd, cap, tpls, cfg, verdict.price, (ix, iy), tag, exe_dir) {
-            Ok(()) => {
-                info!(i, x = cand.x, y = cand.y, "buy: candidate verified");
-                m = Some(*cand);
-                break;
-            }
-            Err(why) => {
-                info!(i, reason = %why, "buy: candidate rejected, trying the next glow");
-                failures.push(format!("candidate {i}: {why}"));
-            }
-        }
-    }
-
-    let Some(m) = m else {
-        crate::input::recover();
-        if let Some((x, y)) = cursor {
-            crate::input::set_cursor_pos(x, y);
-        }
-        return Outcome::Failed(format!(
-            "no glowing item matched the chat price ({} tried): {}",
-            candidates.len(),
-            failures.join("; ")
-        ));
+    let (ix, iy) = m.center();
+    let Some((isx, isy)) = (unsafe { crate::window::client_to_screen(hwnd, ix, iy) }) else {
+        return Outcome::Failed("client_to_screen failed for the item".into());
     };
-
-    // 5. A player shop buys on the right-click itself ("right-click on shop to
+    // 4. A player shop buys on the right-click itself ("right-click on shop to
     //    buy item"); others raise a menu with Buy 1 / Buy X. Wait for the menu,
     //    and if it never appears, check whether the right-click already did it.
     let stack = row.quantity as i64;
@@ -1676,10 +1393,6 @@ fn execute_inner(
     // as it is *complete* (both Buy 1 and Buy X visible), rather than being made
     // to wait out a fixed sleep. That is both quicker and stricter than a sleep:
     // it clicks the instant the entries are all there, and never before.
-    let (ix, iy) = m.center();
-    let Some((isx, isy)) = (unsafe { crate::window::client_to_screen(hwnd, ix, iy) }) else {
-        return Outcome::Failed("client_to_screen failed for the item".into());
-    };
     crate::input::right_click_screen_keep(isx, isy);
     const MENU_POLL_MS: u64 = 5;
     let mut menu = None;

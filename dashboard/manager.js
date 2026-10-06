@@ -432,6 +432,25 @@ function deletePreset() {
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────
+/// Every item in the window, paged.
+///
+/// PostgREST caps one response at 1000 rows and the market has passed that, so a
+/// single call silently drops whole items — Voting token among them — leaving
+/// them uneditable. Ordered by name so the pages tile without gaps or repeats.
+async function loadItems(since) {
+  const page = 1000;
+  const all = [];
+  for (let offset = 0; offset <= 100000; offset += page) {
+    const rows = await rest(
+      `rpc/item_stats?select=*&order=name&limit=${page}&offset=${offset}`,
+      { method: "POST", body: JSON.stringify({ since_ms: since }) }
+    ) || [];
+    all.push(...rows);
+    if (rows.length < page) break;
+  }
+  return all;
+}
+
 async function load() {
   if (!CFG.supabaseUrl || CFG.supabaseUrl.includes("YOUR-PROJECT")) {
     setStatus(`Set <b>supabaseUrl</b> and <b>anonKey</b> in config.js`);
@@ -446,7 +465,7 @@ async function load() {
   state.since = Date.now() - w.ms;
   try {
     const [items, rules, settings] = await Promise.all([
-      rpc("item_stats", { since_ms: state.since }),
+      loadItems(state.since),
       rest("watchlist?select=*"),
       rest("buy_settings?select=*&id=eq.1"),
     ]);

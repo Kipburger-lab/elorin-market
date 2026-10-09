@@ -40,6 +40,11 @@ pub struct BuyConfig {
     pub lookback_days: u32,
     /// Where to write a PNG at every step of a purchase ("" disables).
     pub debug_dir: String,
+    /// Record every purchase attempt to `<debug_dir>/<tag>/<tag>.mp4`, from just
+    /// before the shop is opened until the purchase lands. Needs ffmpeg.
+    pub record_purchases: bool,
+    /// Recording frame rate (1-30).
+    pub record_fps: u64,
     /// Search-until budgets, in the order the purchase needs them.
     pub find_item_ms: u64,
     /// Re-read window before calling an item gone: it can be there one capture
@@ -97,6 +102,14 @@ pub struct BuyConfig {
     /// own border also reads as "yellow", and that artifact is taller than any
     /// item, so an item-sized blob is picked rather than simply the largest.
     pub glow_max_size: i32,
+    /// Smallest a glow candidate may be, per side, to be scored as an item.
+    ///
+    /// The shop draws each item's stack count in the same yellow as the glow, and
+    /// the dotted glow itself can break into fragments — both give small yellow
+    /// blobs that averaged onto a 4x4 grid can *coincidentally* sit closer to our
+    /// icon than the real item does. A real highlight wraps the item, so it is
+    /// never this small; dropping the small ones removes that whole failure.
+    pub glow_min_size: i32,
     /// Most of its bounding box a glow blob may fill.
     ///
     /// **Left off deliberately.** The obvious idea — a glow is a hollow ring, an
@@ -142,6 +155,35 @@ pub struct BuyConfig {
     /// Fraction of the icon's top-left corner to ignore (a quantity badge sits
     /// there in the shop, and in the market when the stack is > 1).
     pub icon_corner_pct: f32,
+    /// Stacks smaller than this are taken with a Shift + left-click (the swapped
+    /// "Buy 10" entry) instead of the right-click menu: one click, no amount
+    /// prompt. `0` disables the fast path. Only used when the session cap covers
+    /// the whole stack — the bulk click can't be trimmed.
+    pub bulk_shift_below: i32,
+
+    /// Where the cyan-outlined market clerks can be searched for, in client px.
+    /// Kept clear of the chatbox and the sidebar, whose own text is cyan too.
+    pub hull_rect: [i32; 4],
+    /// A cyan (00FFFF) hull pixel: red at or below this…
+    pub hull_red_max: i32,
+    /// …green at or above this, blue at or above this…
+    pub hull_green_min: i32,
+    pub hull_blue_min: i32,
+    /// …and green/blue within this of each other (so a pure blue isn't it).
+    pub hull_gb_delta: i32,
+    /// Smallest/largest an NPC hull may be, per side, in client px.
+    pub hull_min_size: i32,
+    pub hull_max_size: i32,
+    /// Most of its bounding box a hull's cyan ink may fill. The hull is a thin
+    /// outline, so a dense cyan blob is something else (chat text, a spell).
+    pub hull_max_fill: f32,
+    /// Join dashes within this many pixels before blob-finding, so a dotted hull
+    /// reads as one shape instead of fragments. Deliberately small: a bigger
+    /// value merges the two adjacent clerks into one blob whose centre lands
+    /// between them, where a right-click misses both.
+    pub hull_join_px: i32,
+    /// How long the market UI may take to appear after clicking the clerk.
+    pub reopen_wait_ms: u64,
 }
 
 impl Default for BuyConfig {
@@ -152,6 +194,8 @@ impl Default for BuyConfig {
             poll_ms: 5_000,
             lookback_days: 30,
             debug_dir: "data/buy".to_string(),
+            record_purchases: true,
+            record_fps: 8,
             find_item_ms: 5_000,
             item_retry_ms: 1_500,
             find_button_ms: 7_000,
@@ -174,6 +218,7 @@ impl Default for BuyConfig {
             glow_red_min: 100,
             glow_rg_delta: 60,
             glow_max_size: 40,
+            glow_min_size: 16,
             glow_max_fill: 1.0,
             icon_profile_max_dist: 0.0,
             menu_radius: 140,
@@ -183,6 +228,17 @@ impl Default for BuyConfig {
             require_menu_pair: true,
             icon_erode_px: 2,
             icon_corner_pct: 0.45,
+            bulk_shift_below: 10,
+            hull_rect: [0, 0, 655, 372],
+            hull_red_max: 90,
+            hull_green_min: 170,
+            hull_blue_min: 170,
+            hull_gb_delta: 60,
+            hull_min_size: 16,
+            hull_max_size: 140,
+            hull_max_fill: 0.5,
+            hull_join_px: 2,
+            reopen_wait_ms: 1_500,
         }
     }
 }
@@ -815,22 +871,31 @@ fn all_blobs(mask: &[bool], w: i32, h: i32) -> Vec<Vec<usize>> {
     out
 }
 
-/// The biggest blob that could plausibly be a single item: enough ink, not so
-/// large that it's part of the panel furniture.
-fn largest_item_blob(mask: &[bool], w: i32, h: i32, cfg: &BuyConfig) -> Option<Vec<usize>> {
+/// Every blob that could plausibly be a single item: enough ink, not so large
+/// that it's part of the panel furniture, biggest first.
+fn all_item_blobs(mask: &[bool], w: i32, h: i32, cfg: &BuyConfig) -> Vec<Vec<usize>> {
     let min_ink = cfg.glow_min_px.max(1) as usize;
+    let min_side = cfg.glow_min_size.max(1);
     let max_side = cfg.glow_max_size.max(8);
-    all_blobs(mask, w, h).into_iter().find(|b| {
-        if b.len() < min_ink {
-            return false;
-        }
-        let (x1, y1, x2, y2) = blob_bbox(b, w);
-        let (bw, bh) = (x2 - x1 + 1, y2 - y1 + 1);
-        if bw > max_side || bh > max_side {
-            return false;
-        }
-        (b.len() as f32 / (bw * bh) as f32) <= cfg.glow_max_fill
-    })
+    all_blobs(mask, w, h)
+        .into_iter()
+        .filter(|b| {
+            if b.len() < min_ink {
+                return false;
+            }
+            let (x1, y1, x2, y2) = blob_bbox(b, w);
+            let (bw, bh) = (x2 - x1 + 1, y2 - y1 + 1);
+            if bw > max_side || bh > max_side {
+                return false;
+            }
+            // A stack-count digit or a glow fragment is small; only a real
+            // highlight wraps an item, so drop the small ones.
+            if bw < min_side || bh < min_side {
+                return false;
+            }
+            (b.len() as f32 / (bw * bh) as f32) <= cfg.glow_max_fill
+        })
+        .collect()
 }
 
 /// The bounding box of the largest 4-connected blob of `mask`.
@@ -896,20 +961,20 @@ fn is_glow_pixel(p: &[u8], cfg: &BuyConfig) -> bool {
         && (g - b) > cfg.glow_green_min
 }
 
-/// Find the item the shop is highlighting.
+/// Find every item-sized glow candidate in `rect`, biggest first.
 ///
-/// The game wraps the item you searched for in a glowing yellow marker, and that
-/// marker is the same for every item — unlike the icon itself, which the shop
-/// draws a few pixels off from the market's copy, so a pixel-perfect comparison
-/// can't work for *any* item. This is the shape-agnostic locator.
-fn find_glow(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Option<Match> {
+/// The game highlights the item it matched with a glowing yellow marker, but
+/// the highlight can sit on whatever the client matched — and a large yellow
+/// *item* can out-size the real glow. Returning them all lets the icon check
+/// ([`best_candidate`]) decide which one is actually ours.
+fn glow_candidates(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Vec<Match> {
     let x1 = rect.x1.max(0).min(frame.width);
     let y1 = rect.y1.max(0).min(frame.height);
     let x2 = rect.x2.max(0).min(frame.width);
     let y2 = rect.y2.max(0).min(frame.height);
     let (w, h) = (x2 - x1, y2 - y1);
     if w <= 0 || h <= 0 {
-        return None;
+        return Vec::new();
     }
 
     let mut mask = vec![false; (w * h) as usize];
@@ -944,14 +1009,278 @@ fn find_glow(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Option<Match> {
         }
     }
 
-    let blob = largest_item_blob(&joined, w, h, cfg)?;
-    let (bx1, by1, bx2, by2) = blob_bbox(&blob, w);
-    Some(Match {
-        x: x1 + bx1,
-        y: y1 + by1,
-        w: bx2 - bx1 + 1,
-        h: by2 - by1 + 1,
+    all_item_blobs(&joined, w, h, cfg)
+        .into_iter()
+        .map(|blob| {
+            let (bx1, by1, bx2, by2) = blob_bbox(&blob, w);
+            Match {
+                x: x1 + bx1,
+                y: y1 + by1,
+                w: bx2 - bx1 + 1,
+                h: by2 - by1 + 1,
+            }
+        })
+        .collect()
+}
+
+/// Find the item the shop is highlighting.
+///
+/// The game wraps the item you searched for in a glowing yellow marker, and that
+/// marker is the same for every item — unlike the icon itself, which the shop
+/// draws a few pixels off from the market's copy, so a pixel-perfect comparison
+/// can't work for *any* item. This is the shape-agnostic locator.
+fn find_glow(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Option<Match> {
+    glow_candidates(frame, rect, cfg).into_iter().next()
+}
+
+/// The market row's icon as a 4x4 grid of mean colours, untrimmed and with no
+/// background keying — exactly what the market drew.
+fn market_icon_grid(frame: &Frame, row: &RowReading, icfg: &IconCfg) -> Option<Vec<[f32; 3]>> {
+    let (w, h, rgb) = plain_icon(frame, row, icfg)?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    Some(colour_grid(w, h, 4, |x, y| {
+        let o = ((y * w + x) * 4) as usize;
+        Some([rgb[o], rgb[o + 1], rgb[o + 2]])
+    }))
+}
+
+/// A shop candidate's icon as a 4x4 grid of mean colours over its bounding box,
+/// in the same orientation as [`market_icon_grid`]. Pixels that read as glow are
+/// skipped.
+fn candidate_grid(shop: &Frame, m: Match, cfg: &BuyConfig) -> Vec<[f32; 3]> {
+    let (w, h) = (m.w.max(1), m.h.max(1));
+    colour_grid(w, h, 4, |x, y| {
+        // The highlight is painted over the item's rim, so leaving it in drags
+        // every real match toward the glow's yellow — which is exactly how a
+        // stray yellow fragment used to out-score the item it was next to.
+        shop.pixel(m.x + x, m.y + y)
+            .filter(|p| !is_glow_pixel(p, cfg))
+            .map(|p| [p[2], p[1], p[0]])
     })
+}
+
+/// Choose the shop slot that best matches the item we scanned.
+///
+/// Every glow candidate is scored by how closely its icon resembles the market
+/// row's own icon — a coarse 4x4 grid of mean colours, which averages away the
+/// few-pixel offset between the market's copy and the shop's and survives the
+/// glow drawn over the item. The lowest distance wins. When even the best is
+/// beyond `icon_profile_max_dist`, the buy is refused rather than taking
+/// whatever happened to glow: that is how a yellow item or a stale highlight
+/// turns into a wrong purchase.
+fn best_candidate(
+    shop: &Frame,
+    market: &Frame,
+    row: &RowReading,
+    icfg: &IconCfg,
+    candidates: &[Match],
+    cfg: &BuyConfig,
+) -> Option<Match> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let Some(target) = market_icon_grid(market, row, icfg) else {
+        // No reference icon to compare against: fall back to the biggest glow.
+        return candidates.first().copied();
+    };
+    let mut best: Option<(f32, Match)> = None;
+    for &c in candidates {
+        let d = grid_distance(&target, &candidate_grid(shop, c, cfg));
+        info!(x = c.x, y = c.y, w = c.w, h = c.h, dist = d, "buy: shop candidate");
+        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, c));
+        }
+    }
+    let (dist, m) = best?;
+    let limit = cfg.icon_profile_max_dist;
+    if limit > 0.0 && dist > limit {
+        warn!(dist, limit, "buy: no shop item matches the scanned icon; refusing");
+        return None;
+    }
+    Some(m)
+}
+
+/// Is this pixel part of a market clerk's cyan (00FFFF) selection hull?
+///
+/// The clerks the market UI hangs off are outlined in cyan when the client marks
+/// them. Cyan specifically — strong green *and* strong blue together — so the
+/// sidebar's blues (green well below blue) and the chat's greens are both out.
+fn is_hull_pixel(p: &[u8], cfg: &BuyConfig) -> bool {
+    let (b, g, r) = (p[0] as i32, p[1] as i32, p[2] as i32);
+    r <= cfg.hull_red_max
+        && g >= cfg.hull_green_min
+        && b >= cfg.hull_blue_min
+        && (g - b).abs() <= cfg.hull_gb_delta
+}
+
+/// The bounding boxes of the cyan clerk hulls inside `rect`, biggest first.
+///
+/// The hull is a dotted outline, so the mask is closed a couple of pixels before
+/// blobs are taken; the box is then the *outline's* extent, whose centre is the
+/// clerk. Candidates are filtered to clerk size and to a thin outline, so the
+/// cyan chatbox text and other UI don't survive. Each hull is returned
+/// separately: merging the two adjacent clerks would put the centre between
+/// them, where a right-click hits neither.
+fn find_hulls(frame: &Frame, rect: Rect, cfg: &BuyConfig) -> Vec<Match> {
+    let x1 = rect.x1.max(0).min(frame.width);
+    let y1 = rect.y1.max(0).min(frame.height);
+    let x2 = rect.x2.max(0).min(frame.width);
+    let y2 = rect.y2.max(0).min(frame.height);
+    let (w, h) = (x2 - x1, y2 - y1);
+    if w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+
+    let mut ink = vec![false; (w * h) as usize];
+    for y in y1..y2 {
+        for x in x1..x2 {
+            if let Some(p) = frame.pixel(x, y) {
+                if is_hull_pixel(&p, cfg) {
+                    ink[((y - y1) * w + (x - x1)) as usize] = true;
+                }
+            }
+        }
+    }
+
+    let mut mask = ink.clone();
+    let join = cfg.hull_join_px.clamp(0, 6);
+    if join > 0 {
+        for y in 0..h {
+            for x in 0..w {
+                if !ink[(y * w + x) as usize] {
+                    continue;
+                }
+                for dy in -join..=join {
+                    for dx in -join..=join {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx >= 0 && ny >= 0 && nx < w && ny < h {
+                            mask[(ny * w + nx) as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for blob in all_blobs(&mask, w, h) {
+        let (bx1, by1, bx2, by2) = blob_bbox(&blob, w);
+        let (bw, bh) = (bx2 - bx1 + 1, by2 - by1 + 1);
+        if bw < cfg.hull_min_size || bh < cfg.hull_min_size {
+            continue;
+        }
+        if bw > cfg.hull_max_size || bh > cfg.hull_max_size {
+            continue;
+        }
+        // Fill is measured on the *raw* mask: the closed one is dilated, which
+        // would make even a thin outline read as solid.
+        let mut filled = 0i32;
+        for y in by1..=by2 {
+            for x in bx1..=bx2 {
+                if ink[(y * w + x) as usize] {
+                    filled += 1;
+                }
+            }
+        }
+        if filled as f32 / (bw * bh) as f32 > cfg.hull_max_fill {
+            continue;
+        }
+        out.push(Match { x: x1 + bx1, y: y1 + by1, w: bw, h: bh });
+    }
+    out.sort_by(|a, b| (b.w * b.h).cmp(&(a.w * a.h)));
+    out
+}
+
+/// Reopen the market after a purchase throws the client out of the interface.
+///
+/// When a shop is emptied or the buy is refused, the client can close the whole
+/// market window, leaving the character in the world. The market hangs off a
+/// clerk NPC outlined in cyan; right-clicking one offers "Open Marketplace
+/// clerk". Find a hull, right-click its centre, click that entry. Best-effort:
+/// returns true when the entry was clicked, not when the market is confirmed.
+pub fn reopen_market(hwnd: HWND, cap: &GdiCapturer, tpls: &MarketTemplates, cfg: &BuyConfig) -> bool {
+    let Some(clerk) = tpls.open_marketplace.as_ref() else {
+        return false;
+    };
+    let area = Rect {
+        x1: cfg.hull_rect[0],
+        y1: cfg.hull_rect[1],
+        x2: cfg.hull_rect[2],
+        y2: cfg.hull_rect[3],
+    };
+    let Ok(frame) = cap.capture_full_client() else {
+        return false;
+    };
+    let Some(hull) = find_hulls(&frame, area, cfg).into_iter().next() else {
+        return false;
+    };
+    let (cx, cy) = hull.center();
+    let Some((sx, sy)) = (unsafe { crate::window::client_to_screen(hwnd, cx, cy) }) else {
+        return false;
+    };
+    if let Some((rx, ry)) = (unsafe {
+        crate::window::client_to_screen(hwnd, cfg.recover_client[0], cfg.recover_client[1])
+    }) {
+        crate::input::set_recover_pos(rx, ry);
+    }
+    info!(x = cx, y = cy, w = hull.w, h = hull.h, "market: right-clicking the clerk");
+    // Keep the pointer on the clerk: the menu belongs to its position, and
+    // moving straight off is what makes a click pass through the UI.
+    crate::input::right_click_screen_keep(sx, sy);
+
+    let near = Rect {
+        x1: (hull.x - cfg.menu_radius).max(0),
+        y1: (hull.y - cfg.menu_radius).max(0),
+        x2: hull.x + hull.w + cfg.menu_radius,
+        y2: hull.y + hull.h + cfg.menu_radius,
+    };
+    std::thread::sleep(Duration::from_millis(cfg.menu_settle_ms));
+    let Some((menu, true)) = wait_for_every(cap, cfg.find_button_ms, 5, |f| {
+        best_match(f, clerk, near, cfg.button_tolerance, 1).is_some()
+    }) else {
+        warn!("market: the clerk's menu never showed \"Open Marketplace\"");
+        crate::input::recover();
+        return false;
+    };
+    let Some(bm) = best_match(&menu, clerk, near, cfg.button_tolerance, 1) else {
+        crate::input::recover();
+        return false;
+    };
+    let (bx, by) = bm.center();
+    let Some((bsx, bsy)) = (unsafe { crate::window::client_to_screen(hwnd, bx, by) }) else {
+        crate::input::recover();
+        return false;
+    };
+    info!("market: clicking \"Open Marketplace\"");
+    crate::input::click_screen_keep(bsx, bsy);
+    std::thread::sleep(Duration::from_millis(cfg.reopen_wait_ms));
+    crate::input::recover();
+    true
+}
+
+/// Put the client back on the offers list after the loop loses it.
+///
+/// First try the cheap case: the market is up but on another page (Featured
+/// Shops), where "View Recent Offers" is one click away. Otherwise the market is
+/// closed entirely and has to be reopened through a clerk. Returns true when an
+/// action was taken, so the caller can rescan straight away.
+pub fn recover_market(hwnd: HWND, cap: &GdiCapturer, tpls: &MarketTemplates, cfg: &BuyConfig) -> bool {
+    let Ok(frame) = cap.capture_full_client() else {
+        return false;
+    };
+    if let Some(t) = tpls.recent_offers.as_ref() {
+        if let Some(m) = template::find(&frame, t, cfg.button_tolerance) {
+            let (cx, cy) = m.center();
+            if let Some((sx, sy)) = (unsafe { crate::window::client_to_screen(hwnd, cx, cy) }) {
+                info!("market: clicking \"View Recent Offers\" to restore the list");
+                crate::input::click_screen(sx, sy);
+                return true;
+            }
+        }
+    }
+    reopen_market(hwnd, cap, tpls, cfg)
 }
 
 /// Capture repeatedly until `pred` accepts a frame, or `timeout_ms` elapses.
@@ -1240,7 +1569,31 @@ pub fn execute(
     discord_cfg: &crate::discord::DiscordConfig,
 ) -> Outcome {
     let tag = crate::market::now_ms().to_string();
+    // Record the whole attempt — from just before the shop is opened until the
+    // purchase lands — so a wrong buy can be reviewed, not guessed at. The dir
+    // is per-attempt so encoding never touches another attempt's frames.
+    let recorder = cfg.record_purchases.then(|| {
+        crate::record::Recorder::start(
+            hwnd,
+            cfg.record_fps,
+            exe_dir.join(&cfg.debug_dir).join(&tag),
+            tag.clone(),
+        )
+    });
     let outcome = execute_inner(exe_dir, hwnd, cap, frame, row, verdict, tpls, icon_cfg, cfg, &tag);
+    if let Some(rec) = recorder {
+        let disco = discord_cfg.clone();
+        let rec_name = row.name.clone();
+        // Encode on its own thread: the timed clicks that follow must not wait on
+        // an ffmpeg run. The MP4 is then posted to Discord for review.
+        std::thread::spawn(move || match rec.stop() {
+            Some(p) => {
+                info!(path = %p.display(), "buy: purchase recording saved");
+                crate::discord::notify_purchase_video(disco, rec_name, p);
+            }
+            None => warn!("buy: purchase recording could not be encoded"),
+        });
+    }
     if let Outcome::Bought { units, .. } = outcome {
         if discord_cfg.is_configured() {
             let icon_png = crate::market::crop_icon(frame, &row.open, icon_cfg)
@@ -1341,7 +1694,7 @@ fn execute_inner(
         x2: cfg.glow_rect[2],
         y2: cfg.glow_rect[3],
     };
-    let searched = wait_for(cap, cfg.find_item_ms, |f| find_glow(f, glow_area, cfg).is_some());
+    let searched = wait_for(cap, cfg.find_item_ms, |f| !glow_candidates(f, glow_area, cfg).is_empty());
     let Some((shop, found)) = searched else {
         return Outcome::Failed("screen capture failed while looking for the glow".into());
     };
@@ -1351,22 +1704,27 @@ fn execute_inner(
     }
     shot("02_shop", &shop);
 
-    let m = match find_glow(&shop, glow_area, cfg) {
+    // Collect every candidate, then pick the one whose icon actually resembles
+    // the item we scanned. If the highlight is on a different (yellow) item,
+    // the icon check rejects it rather than buying the wrong thing.
+    let mut cands = glow_candidates(&shop, glow_area, cfg);
+    if cands.is_empty() {
+        // It was there a moment ago; re-read the frame before giving up.
+        let Some((again, _)) =
+            wait_for(cap, cfg.item_retry_ms, |f| !glow_candidates(f, glow_area, cfg).is_empty())
+        else {
+            return Outcome::Failed("screen capture failed re-checking the glow".into());
+        };
+        cands = glow_candidates(&again, glow_area, cfg);
+    }
+    let m = match best_candidate(&shop, frame, row, icon_cfg, &cands, cfg) {
         Some(m) => {
-            info!(x = m.x, y = m.y, w = m.w, h = m.h, "buy: glowing item found, right-clicking");
+            info!(x = m.x, y = m.y, w = m.w, h = m.h, "buy: best icon match, right-clicking");
             m
         }
         None => {
-            // It was there a moment ago; re-read the frame before giving up.
-            let Some((again, _)) = wait_for(cap, cfg.item_retry_ms, |f| {
-                find_glow(f, glow_area, cfg).is_some()
-            }) else {
-                return Outcome::Failed("screen capture failed re-checking the glow".into());
-            };
-            match find_glow(&again, glow_area, cfg) {
-                Some(m) => m,
-                None => return Outcome::Gone { name },
-            }
+            shot("02_shop", &shop);
+            return Outcome::Gone { name };
         }
     };
     let (ix, iy) = m.center();
@@ -1377,6 +1735,15 @@ fn execute_inner(
     //    buy item"); others raise a menu with Buy 1 / Buy X. Wait for the menu,
     //    and if it never appears, check whether the right-click already did it.
     let stack = row.quantity as i64;
+    // Shift + left-click fires the swapped "Buy 10" entry: one click, no menu and
+    // no amount prompt. Prefer it for everything whenever it is available — the
+    // speed is what keeps a good trade from being sniped out from under us — and
+    // take `min(10, stack)`, accepting that a small stack may pass the session
+    // cap. Later passes pick up whatever is left, so a big stack still fills up,
+    // just ten at a time. With the fast path off (bulk_shift_below = 0) the
+    // right-click menu still handles Buy 1 / Buy X with the exact amount.
+    let bulk_take = stack.min(cfg.bulk_shift_below.max(0) as i64);
+    let fast_bulk = cfg.bulk_shift_below > 0 && bulk_take > 0;
     let buy_x = use_buy_x(stack);
     let label = if buy_x { "Buy X" } else { "Buy 1" };
     let near = Rect {
@@ -1402,146 +1769,153 @@ fn execute_inner(
         }
     };
 
-    // Right-click the item, then wait for the menu. The click can land before
-    // the client holds the hover it resolves against, in which case no menu is
-    // raised at all — so allow it a second right-click before giving up.
-    // The pointer stays on the item throughout: the menu belongs to it.
-    //
-    // After the floor below, the menu is polled every few ms and clicked as soon
-    // as it is *complete* (both Buy 1 and Buy X visible), rather than being made
-    // to wait out a fixed sleep. That is both quicker and stricter than a sleep:
-    // it clicks the instant the entries are all there, and never before.
-    crate::input::right_click_screen_keep(isx, isy);
-    const MENU_POLL_MS: u64 = 5;
-    let mut menu = None;
-    for attempt in 0..2 {
-        std::thread::sleep(Duration::from_millis(cfg.menu_settle_ms));
-        let half = (cfg.find_button_ms / 2).max(1);
-        match wait_for_every(cap, half, MENU_POLL_MS, menu_ready) {
-            Some((f, true)) => {
-                menu = Some((f, true));
-                break;
-            }
-            other => {
-                if let Some((last, _)) = other {
-                    shot("03_rc", &last);
+    let units: i64 = if fast_bulk {
+        info!(stack, take = bulk_take, bulk = cfg.bulk_shift_below, "buy: shift-clicking the stack");
+        crate::input::shift_click_screen_keep(isx, isy);
+        std::thread::sleep(Duration::from_millis(250));
+        shot("05_after", &shop);
+        bulk_take
+    } else {
+        // Right-click the item, then wait for the menu. The click can land before
+        // the client holds the hover it resolves against, in which case no menu is
+        // raised at all — so allow it a second right-click before giving up.
+        // The pointer stays on the item throughout: the menu belongs to it.
+        //
+        // After the floor below, the menu is polled every few ms and clicked as soon
+        // as it is *complete* (both Buy 1 and Buy X visible), rather than being made
+        // to wait out a fixed sleep. That is both quicker and stricter than a sleep:
+        // it clicks the instant the entries are all there, and never before.
+        crate::input::right_click_screen_keep(isx, isy);
+        const MENU_POLL_MS: u64 = 5;
+        let mut menu = None;
+        for attempt in 0..2 {
+            std::thread::sleep(Duration::from_millis(cfg.menu_settle_ms));
+            let half = (cfg.find_button_ms / 2).max(1);
+            match wait_for_every(cap, half, MENU_POLL_MS, menu_ready) {
+                Some((f, true)) => {
+                    menu = Some((f, true));
+                    break;
                 }
-                if attempt == 0 {
-                    // Move the pointer clear *before* clicking again: if a menu
-                    // did open, a second right-click at the item's spot lands on
-                    // the menu instead, and picks whatever is under the cursor.
-                    crate::input::recover();
-                    std::thread::sleep(Duration::from_millis(150));
-                    // With the pointer clear, look once more before clicking —
-                    // the menu may simply have been missed the first time.
-                    if let Some((f, true)) = wait_for_every(cap, half, MENU_POLL_MS, menu_ready) {
-                        menu = Some((f, true));
-                        break;
+                other => {
+                    if let Some((last, _)) = other {
+                        shot("03_rc", &last);
                     }
-                    info!("buy: no menu after the right-click; clicking it once more");
-                    crate::input::right_click_screen_keep(isx, isy);
+                    if attempt == 0 {
+                        // Move the pointer clear *before* clicking again: if a menu
+                        // did open, a second right-click at the item's spot lands on
+                        // the menu instead, and picks whatever is under the cursor.
+                        crate::input::recover();
+                        std::thread::sleep(Duration::from_millis(150));
+                        // With the pointer clear, look once more before clicking —
+                        // the menu may simply have been missed the first time.
+                        if let Some((f, true)) = wait_for_every(cap, half, MENU_POLL_MS, menu_ready) {
+                            menu = Some((f, true));
+                            break;
+                        }
+                        info!("buy: no menu after the right-click; clicking it once more");
+                        crate::input::right_click_screen_keep(isx, isy);
+                    }
                 }
             }
         }
-    }
 
-    let units;
-    match menu {
-        Some((menu_frame, true)) => {
-            // A menu: click the entry we want.
-            shot("03_menu", &menu_frame);
-            let button = (if buy_x { tpls.buy_x.as_ref() } else { tpls.buy1.as_ref() })
-                .expect("button checked above");
-            let Some(bm) = best_match(&menu_frame, button, near, cfg.button_tolerance, 1) else {
-                return Outcome::Failed(format!("{label} disappeared before the click"));
-            };
-            let (bx, by) = bm.center();
-            let Some((bsx, bsy)) = (unsafe { crate::window::client_to_screen(hwnd, bx, by) }) else {
-                return Outcome::Failed("client_to_screen failed for the buy button".into());
-            };
-            info!(button = label, "buy: clicking");
-            crate::input::click_screen_keep(bsx, bsy);
+        match menu {
+            Some((menu_frame, true)) => {
+                // A menu: click the entry we want.
+                shot("03_menu", &menu_frame);
+                let button = (if buy_x { tpls.buy_x.as_ref() } else { tpls.buy1.as_ref() })
+                    .expect("button checked above");
+                let Some(bm) = best_match(&menu_frame, button, near, cfg.button_tolerance, 1) else {
+                    return Outcome::Failed(format!("{label} disappeared before the click"));
+                };
+                let (bx, by) = bm.center();
+                let Some((bsx, bsy)) = (unsafe { crate::window::client_to_screen(hwnd, bx, by) }) else {
+                    return Outcome::Failed("client_to_screen failed for the buy button".into());
+                };
+                info!(button = label, "buy: clicking");
+                crate::input::click_screen_keep(bsx, bsy);
 
-            // 5. Buy X asks for an amount.
-            units = if buy_x {
-                let Some(prompt) = tpls.enter_amount.as_ref() else {
-                    return Outcome::Failed("Validations/Enter amount.png is missing".into());
-                };
-                let area = Rect {
-                    x1: cfg.amount_rect[0],
-                    y1: cfg.amount_rect[1],
-                    x2: cfg.amount_rect[2],
-                    y2: cfg.amount_rect[3],
-                };
-                // Polled as fast as the capture allows, then two beats: one for
-                // the prompt to take focus before the digits, one for the digits
-                // to land before Enter confirms them.
-                let Some((prompt_frame, seen)) =
-                    wait_for_every(cap, cfg.amount_wait_ms, 1, |f| {
-                        best_match(f, prompt, area, cfg.button_tolerance, 1).is_some()
-                    })
-                else {
-                    return Outcome::Failed("screen capture failed while waiting for Enter amount".into());
-                };
-                shot("04_amount", &prompt_frame);
-                if !seen {
+                // 5. Buy X asks for an amount.
+                if buy_x {
+                    let Some(prompt) = tpls.enter_amount.as_ref() else {
+                        return Outcome::Failed("Validations/Enter amount.png is missing".into());
+                    };
+                    let area = Rect {
+                        x1: cfg.amount_rect[0],
+                        y1: cfg.amount_rect[1],
+                        x2: cfg.amount_rect[2],
+                        y2: cfg.amount_rect[3],
+                    };
+                    // Polled as fast as the capture allows, then two beats: one for
+                    // the prompt to take focus before the digits, one for the digits
+                    // to land before Enter confirms them.
+                    let Some((prompt_frame, seen)) =
+                        wait_for_every(cap, cfg.amount_wait_ms, 1, |f| {
+                            best_match(f, prompt, area, cfg.button_tolerance, 1).is_some()
+                        })
+                    else {
+                        return Outcome::Failed("screen capture failed while waiting for Enter amount".into());
+                    };
+                    shot("04_amount", &prompt_frame);
+                    if !seen {
+                        return Outcome::Failed(format!(
+                            "\"Enter amount\" not found within {}ms",
+                            cfg.amount_wait_ms
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(cfg.amount_pause_ms));
+                    let want = amount_for(stack, verdict.qty_limit, verdict.bought);
+                    if want <= 0 {
+                        return Outcome::Failed("nothing left within the session cap".into());
+                    }
+                    info!(want, stack, limit = verdict.qty_limit, bought = verdict.bought, "buy: typing the amount");
+                    crate::input::type_digits(&want.to_string(), cfg.key_delay_ms);
+                    std::thread::sleep(Duration::from_millis(cfg.enter_delay_ms));
+                    crate::input::tap_enter(cfg.key_delay_ms);
+                    want
+                } else {
+                    info!("buy: Buy 1 clicked");
+                    1
+                }
+            }
+            _ => {
+                // No menu within the window. Either the right-click bought the item
+                // outright (player shops buy on right-click), or the menu is simply
+                // late — it took ~4s in a live run. Once it opens it **covers** the
+                // item, hiding the glow, so a bare glow check would read that as a
+                // successful purchase. Look for the menu on the last frame first.
+                if let Some((last, _)) = &menu {
+                    if menu_ready(last) {
+                        return Outcome::Failed(
+                            "the buy menu appeared after the window; retrying".into(),
+                        );
+                    }
+                }
+                let bought = wait_for(cap, cfg.direct_buy_ms, |f| {
+                    // Only believe "it's gone" while the shop is still on screen. If
+                    // the client went away — quit, minimised, alt-tabbed — every
+                    // capture is empty, no glow is found, and that reads as a
+                    // purchase that never happened.
+                    shop_is_open(f, tpls, cfg.button_tolerance)
+                        && match find_glow(f, glow_area, cfg) {
+                            None => true,
+                            Some(g) => !overlaps(g, m),
+                        }
+                })
+                .map(|(_, ok)| ok)
+                .unwrap_or(false);
+                if !bought {
                     return Outcome::Failed(format!(
-                        "\"Enter amount\" not found within {}ms",
-                        cfg.amount_wait_ms
+                        "right-click produced no {label} menu and the item is still listed"
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(cfg.amount_pause_ms));
-                let want = amount_for(stack, verdict.qty_limit, verdict.bought);
-                if want <= 0 {
-                    return Outcome::Failed("nothing left within the session cap".into());
-                }
-                info!(want, stack, limit = verdict.qty_limit, bought = verdict.bought, "buy: typing the amount");
-                crate::input::type_digits(&want.to_string(), cfg.key_delay_ms);
-                std::thread::sleep(Duration::from_millis(cfg.enter_delay_ms));
-                crate::input::tap_enter(cfg.key_delay_ms);
+                shot("05_after", &shop);
+                let want = amount_for(stack, verdict.qty_limit, verdict.bought).max(1);
+                info!(items = want, "buy: right-click bought the item directly");
                 want
-            } else {
-                info!("buy: Buy 1 clicked");
-                1
-            };
-        }
-        _ => {
-            // No menu within the window. Either the right-click bought the item
-            // outright (player shops buy on right-click), or the menu is simply
-            // late — it took ~4s in a live run. Once it opens it **covers** the
-            // item, hiding the glow, so a bare glow check would read that as a
-            // successful purchase. Look for the menu on the last frame first.
-            if let Some((last, _)) = &menu {
-                if menu_ready(last) {
-                    return Outcome::Failed(
-                        "the buy menu appeared after the window; retrying".into(),
-                    );
-                }
             }
-            let bought = wait_for(cap, cfg.direct_buy_ms, |f| {
-                // Only believe "it's gone" while the shop is still on screen. If
-                // the client went away — quit, minimised, alt-tabbed — every
-                // capture is empty, no glow is found, and that reads as a
-                // purchase that never happened.
-                shop_is_open(f, tpls, cfg.button_tolerance)
-                    && match find_glow(f, glow_area, cfg) {
-                        None => true,
-                        Some(g) => !overlaps(g, m),
-                    }
-            })
-            .map(|(_, ok)| ok)
-            .unwrap_or(false);
-            if !bought {
-                return Outcome::Failed(format!(
-                    "right-click produced no {label} menu and the item is still listed"
-                ));
-            }
-            shot("05_after", &shop);
-            let want = amount_for(stack, verdict.qty_limit, verdict.bought).max(1);
-            info!(items = want, "buy: right-click bought the item directly");
-            units = want;
         }
-    }
+    };
 
     std::thread::sleep(Duration::from_millis(400));
     if let Ok(f) = cap.capture_full_client() {

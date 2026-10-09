@@ -18,6 +18,7 @@ pub mod input;
 pub mod market;
 pub mod ocr;
 pub mod overlay;
+pub mod record;
 pub mod search;
 pub mod window;
 

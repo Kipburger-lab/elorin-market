@@ -287,6 +287,77 @@ fn send_stuck(cfg: &DiscordConfig, video_path: Option<&Path>) -> Result<()> {
     }
 }
 
+/// Send a purchase's recording as its own message.
+///
+/// Unlike the icon in the purchase embed, an MP4 is too big to inline, so it is
+/// attached to a short embed of its own. Runs in its own thread.
+pub fn notify_purchase_video(cfg: DiscordConfig, name: String, video_path: PathBuf) {
+    if !cfg.is_configured() {
+        return;
+    }
+    thread::spawn(move || {
+        if let Err(e) = send_recording(&cfg, &name, &video_path) {
+            warn!(error = %e, "discord purchase recording failed");
+        }
+    });
+}
+
+fn send_recording(cfg: &DiscordConfig, name: &str, path: &Path) -> Result<()> {
+    let embed = Embed {
+        title: format!("Recording: {name}"),
+        color: 0x3498DB,
+        fields: vec![Field {
+            name: "Purchase attempt".to_string(),
+            value: "From just before the shop opened until the purchase landed".to_string(),
+            inline: false,
+        }],
+        image: None,
+        footer: Some(Footer {
+            text: "Elorin Market Scanner".to_string(),
+        }),
+    };
+    let payload = Payload {
+        username: "Elorin Bot".to_string(),
+        avatar_url: cfg.avatar_url.clone(),
+        embeds: vec![embed],
+    };
+    let payload_json = serde_json::to_string(&payload)?;
+
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recording.mp4")
+        .to_string();
+    let mp4 = std::fs::read(path).with_context(|| format!("reading {path:?}"))?;
+
+    let mut body = Vec::new();
+    let boundary = generate_boundary();
+    let b = boundary.as_str();
+    write_part_header(&mut body, b, "payload_json", None, Some("application/json"));
+    body.extend_from_slice(payload_json.as_bytes());
+    body.extend_from_slice(b"\r\n");
+    write_part_header(&mut body, b, "files[0]", Some(&filename), Some("video/mp4"));
+    body.extend_from_slice(&mp4);
+    body.extend_from_slice(b"\r\n");
+    write_boundary_end(&mut body, b);
+
+    let resp = ureq::post(&cfg.webhook_url)
+        .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .timeout(std::time::Duration::from_secs(60))
+        .send_bytes(&body);
+
+    match resp {
+        Ok(r) => {
+            info!(status = r.status(), "discord purchase recording sent");
+            Ok(())
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            Err(anyhow::anyhow!("discord webhook returned status {code}"))
+        }
+        Err(e) => Err(anyhow::anyhow!("discord webhook request failed: {e}")),
+    }
+}
+
 fn generate_boundary() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()

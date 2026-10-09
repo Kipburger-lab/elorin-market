@@ -24,6 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
 /// stuck state we have been chasing.
 pub const VK_RETURN: u32 = 0x0D;
 
+/// Shift: held across the click that uses the swapped "Buy 10" entry.
+pub const VK_SHIFT: u32 = 0x10;
+
 /// Current cursor position in screen coordinates.
 pub fn cursor_pos() -> Option<(i32, i32)> {
     let mut p = POINT::default();
@@ -84,6 +87,30 @@ pub fn click_screen_keep(sx: i32, sy: i32) {
 /// Right-click and leave the cursor there (see [`click_screen_keep`]).
 pub fn right_click_screen_keep(sx: i32, sy: i32) {
     click_with(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, sx, sy);
+}
+
+/// Shift + left-click, leaving the cursor on the target.
+///
+/// The client's menu-entry swapper turns this into the item's "Buy 10" action in
+/// a single click — no right-click menu and no amount prompt. Shift is held for
+/// the whole glide and click so the client sees the modifier on the press, then
+/// released so it can't leak into the next action.
+pub fn shift_click_screen_keep(sx: i32, sy: i32) {
+    shift_down();
+    std::thread::sleep(Duration::from_millis(40));
+    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy);
+    std::thread::sleep(Duration::from_millis(40));
+    shift_up();
+}
+
+/// Press Shift down (for [`shift_click_screen_keep`]).
+pub fn shift_down() {
+    send_key(VK_SHIFT, false);
+}
+
+/// Release Shift.
+pub fn shift_up() {
+    send_key(VK_SHIFT, true);
 }
 
 /// Move the cursor with a real `SendInput` absolute move over the whole virtual

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
-use tracing::{info, level_filters::LevelFilter, warn};
+use tracing::{debug, info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
@@ -336,60 +336,6 @@ fn frame_signature(f: &Frame) -> u64 {
     h
 }
 
-/// Fold the numbered frames in `dir` into one MP4, if ffmpeg is installed.
-///
-/// A 30-second PNG sequence is tens of megabytes; the same footage as H.264 is
-/// a couple — PNG is lossless per frame, so it cannot use the fact that almost
-/// nothing changes. Best-effort by design: with no ffmpeg on PATH the frames are
-/// left alone, which still records everything.
-fn encode_with_ffmpeg(dir: &Path, tag: u128) -> bool {
-    let pattern = dir.join(format!("{tag}_%04d.png"));
-    let out = dir.join(format!("{tag}.mp4"));
-    let encoded = std::process::Command::new("ffmpeg")
-        .arg("-y")
-        .args(["-framerate", "4", "-start_number", "0", "-i"])
-        .arg(&pattern)
-        // yuv420p needs even dimensions and the client is 811x571 — both odd —
-        // so pad by a pixel. Without this the encode fails outright, every time.
-        .args([
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-vf",
-            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            "-crf",
-            "28",
-            "-loglevel",
-            "error",
-        ])
-        .arg(&out)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !encoded {
-        warn!("ffmpeg could not encode the recording; the frames are kept as PNGs");
-    }
-
-    if encoded {
-        // The video supersedes the frames; keeping both doubles the space for
-        // no extra information.
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().is_some_and(|x| x == "png") {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-        info!(video = %out.display(), "stuck recording encoded");
-    }
-    encoded
-}
-
 /// Record the client for `seconds`, into `data/stuck/<tag>/`.
 ///
 /// Called when the loop finds itself somewhere it does not recognise and stays
@@ -452,7 +398,7 @@ fn record_client(cap: &GdiCapturer, exe_dir: &Path, seconds: u64, title_contains
         );
     }
     if saved > 1 {
-        if encode_with_ffmpeg(&dir, tag) {
+        if elorin_bot::record::encode_with_ffmpeg(&dir, &tag.to_string(), 4) {
             return Some(dir.join(format!("{tag}.mp4")));
         }
     }
@@ -467,6 +413,9 @@ fn loop_thread() {
     // is a few seconds, long enough to be a genuine stuck state rather than a
     // single bad frame.
     const STUCK_AFTER: u32 = 20;
+    // Before recording a stuck episode, give recovery a chance: the market is
+    // usually just closed, not broken.
+    const REOPEN_AFTER: u32 = 4;
     let mut stuck: u32 = 0;
 
     while !EXIT_REQUESTED.load(Ordering::Relaxed) {
@@ -511,6 +460,8 @@ fn loop_thread() {
         }
 
         let cap = GdiCapturer::new(hwnd);
+        // Keep the OS pointer off the panel for every capture this pass.
+        park_cursor(hwnd, &app.cfg);
 
         // Seed the "previous" set once so the first change doesn't store the
         // whole list that was already there.
@@ -541,7 +492,12 @@ fn loop_thread() {
                 stuck = 0;
                 let (cx, cy) = m.center();
                 match unsafe { window::client_to_screen(hwnd, cx, cy) } {
-                    Some((sx, sy)) => input::click_screen(sx, sy),
+                    Some((sx, sy)) => {
+                        input::click_screen(sx, sy);
+                        // Lift the pointer off the button the instant the click
+                        // lands, so its sprite is back before the next find.
+                        park_cursor(hwnd, &app.cfg);
+                    }
                     None => {
                         warn!("client_to_screen failed for refresh");
                         std::thread::sleep(Duration::from_millis(300));
@@ -551,10 +507,23 @@ fn loop_thread() {
             }
             None => {
                 set_status("loop: Refresh button not found");
-                // Not on the market page and not moving: record a window of the
-                // client so whatever happened can be reviewed afterwards. Once
-                // per episode, not on every pass.
                 stuck += 1;
+                // The client drops out of the market window when a purchase
+                // empties a shop or the buy is refused. Before recording that as
+                // a stuck episode, try to put the offers list back: click
+                // "View Recent Offers" if the market is on another page, or
+                // reopen the market through a clerk if it closed entirely.
+                if stuck >= REOPEN_AFTER {
+                    if elorin_bot::buy::recover_market(hwnd, &cap, &app.tpls, &app.cfg.buy) {
+                        info!("loop: market recovery attempted; rescanning");
+                        stuck = 0;
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                }
+                // Not recoverable and not moving: record a window of the client
+                // so whatever happened can be reviewed afterwards. Once per
+                // episode, not on every pass.
                 if stuck == STUCK_AFTER {
                     let video = record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
                     elorin_bot::discord::notify_stuck(app.cfg.discord.clone(), video);
@@ -566,13 +535,18 @@ fn loop_thread() {
         }
 
         // 2. Poll the watch region until it changes (or the timeout expires).
+        //    No change means the refresh brought nothing new, so the loop clicks
+        //    Refresh again and this window is what paces the idle refresh rate:
+        //    a shorter window refreshes more often, but must still be long enough
+        //    for a render to land, or the change is missed and clicked over.
         let wr = market::watch_rect(&app.cfg.watch);
         let baseline = match cap.capture_region(wr) {
             Ok(f) => market::signature(&f, app.cfg.watch),
             Err(_) => continue,
         };
         let poll = Duration::from_millis(app.cfg.refresh.poll_ms.max(1));
-        let deadline = Instant::now() + Duration::from_millis(app.cfg.refresh.timeout_ms);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(app.cfg.refresh.timeout_ms);
         let mut changed = false;
         while Instant::now() < deadline
             && LOOP_ACTIVE.load(Ordering::SeqCst)
@@ -588,9 +562,11 @@ fn loop_thread() {
         }
 
         if !changed {
+            debug!(ms = started.elapsed().as_millis() as u64, "refresh window closed with no change");
             set_status("loop: no change in time - refreshing again");
             continue;
         }
+        debug!(ms = started.elapsed().as_millis() as u64, "refresh changed");
 
         // 3. A change landed: full scan and store only the new rows.
         let full = match cap.capture_full_client() {
@@ -635,6 +611,21 @@ fn set_result(result: ScanResult, status: &str) {
 
 fn set_status(msg: &str) {
     state().lock().status = msg.to_string();
+}
+
+/// Park the pointer on the configured inert spot.
+///
+/// BitBlt captures the OS cursor too, so a pointer left resting on the Refresh
+/// button can cover enough of its sprite that the next `find_refresh` misses it
+/// — and one left over the offer rows bleeds into the watch region and reads as
+/// a change that never happened. Run this before each capture, and again after
+/// the Refresh click, so the pointer is never on the panel.
+fn park_cursor(hwnd: HWND, cfg: &MarketConfig) {
+    let [px, py] = cfg.buy.recover_client;
+    if let Some((rx, ry)) = unsafe { window::client_to_screen(hwnd, px, py) } {
+        input::set_recover_pos(rx, ry);
+        input::recover();
+    }
 }
 
 // ---------------------------------------------------------------------------

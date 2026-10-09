@@ -369,6 +369,12 @@ pub struct MarketTemplates {
     pub buy_x: Option<Template>,
     /// `Validations/Enter amount.png` — the chatbox prompt after Buy X.
     pub enter_amount: Option<Template>,
+    /// `Buttons/Recent offers.png` — the "View Recent Offers" button, to return
+    /// to the offers list if the market is left on another page.
+    pub recent_offers: Option<Template>,
+    /// `Buttons/Open Marketplace.png` — the clerk's right-click entry, used to
+    /// reopen the market after a purchase throws us out of the interface.
+    pub open_marketplace: Option<Template>,
 }
 
 /// Load `Sprites/Utility/Buttons/{Open,Refresh}.png` and
@@ -409,6 +415,8 @@ pub fn load_templates(sprites_dir: &Path) -> Result<MarketTemplates> {
         buy1: Template::load(&buttons.join("Buy 1.png")).ok(),
         buy_x: Template::load(&buttons.join("Buy X.png")).ok(),
         enter_amount: Template::load(&sprites_dir.join("Utility").join("Validations").join("Enter amount.png")).ok(),
+        recent_offers: Template::load(&buttons.join("Recent offers.png")).ok(),
+        open_marketplace: Template::load(&buttons.join("Open Marketplace.png")).ok(),
     })
 }
 
@@ -1868,6 +1876,8 @@ mod tests {
             buy1: None,
             buy_x: None,
             enter_amount: None,
+            recent_offers: None,
+            open_marketplace: None,
             digits: vec![
                 (1, solid(3, 16, (255, 0, 0))),
                 (3, solid(3, 16, (0, 255, 0))),
@@ -1896,6 +1906,8 @@ mod tests {
             buy1: None,
             buy_x: None,
             enter_amount: None,
+            recent_offers: None,
+            open_marketplace: None,
             digits: vec![
                 (1, solid(3, 16, (255, 0, 0))),
                 (3, solid(3, 16, (0, 255, 0))),
@@ -1919,6 +1931,8 @@ mod tests {
             buy1: None,
             buy_x: None,
             enter_amount: None,
+            recent_offers: None,
+            open_marketplace: None,
             digits: vec![(2, exact), (9, near)],
         };
         let read = read_price(&f, &tpls, f.rect(), 35, 0.5);
@@ -1943,6 +1957,8 @@ mod tests {
             buy1: None,
             buy_x: None,
             enter_amount: None,
+            recent_offers: None,
+            open_marketplace: None,
             digits: vec![
                 (5, solid(4, 14, (255, 0, 0))),
                 (0, solid(4, 14, (0, 255, 0))),

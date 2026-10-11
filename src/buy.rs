@@ -19,7 +19,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::capture::gdi::GdiCapturer;
 use crate::capture::{Frame, Rect};
-use crate::market::{IconCfg, MarketTemplates, RowReading};
+use crate::market::{IconCfg, MarketConfig, MarketTemplates, RowReading};
 use crate::search::template::{self, Template};
 use crate::search::Match;
 
@@ -203,7 +203,7 @@ impl Default for BuyConfig {
             amount_rect: [0, 330, 811, 571],
             amount_pause_ms: 300,
             enter_delay_ms: 300,
-            shop_wait_ms: 4_000,
+            shop_wait_ms: 1_200,
             market_back_ms: 2_500,
             after_buy_ms: 1_000,
             recent_offers_ms: 3_000,
@@ -721,16 +721,12 @@ fn plain_icon(frame: &Frame, row: &RowReading, icfg: &IconCfg) -> Option<(i32, i
     crate::market::crop_icon(frame, &row.open, &plain)
 }
 
-/// Build an icon template from the frame we scanned — the **fallback** locator,
-/// used only when the shop's glow isn't found.
+/// The market row's icon as an untrimmed template: colours from the raw crop,
+/// silhouette from the background-keyed one, so the two align pixel for pixel.
 ///
 /// Deliberately *not* the stored `data/icons/*.png`: that crop can have the
-/// yellow stack count baked in, which the shop doesn't render. Colours come from
-/// the raw crop, the silhouette from the keyed one, and both are untrimmed so
-/// they stay aligned. [`prepare_icon_template`] then whittles it down.
-pub fn icon_template(frame: &Frame, row: &RowReading, icfg: &IconCfg, buy_cfg: &BuyConfig) -> Option<Template> {
-    // Colours come from the raw crop; the silhouette from the keyed one. Both are
-    // untrimmed, so they align pixel for pixel.
+/// yellow stack count baked in, which the shop doesn't render.
+fn icon_template_raw(frame: &Frame, row: &RowReading, icfg: &IconCfg) -> Option<Template> {
     let mut plain = icfg.clone();
     plain.remove_bg = false;
     plain.trim = false;
@@ -753,9 +749,26 @@ pub fn icon_template(frame: &Frame, row: &RowReading, icfg: &IconCfg, buy_cfg: &
             img.put_pixel(x as u32, y as u32, image::Rgba([rgb[o], rgb[o + 1], rgb[o + 2], a]));
         }
     }
+    Some(Template::from_image_rgba(&img))
+}
 
-    let mut tpl = Template::from_image_rgba(&img);
+/// The glow locator's template: eroded and reduced so the highlight painted over
+/// the item's rim can't spoil the match.
+pub fn icon_template(frame: &Frame, row: &RowReading, icfg: &IconCfg, buy_cfg: &BuyConfig) -> Option<Template> {
+    let mut tpl = icon_template_raw(frame, row, icfg)?;
     prepare_icon_template(&mut tpl, buy_cfg);
+    Some(tpl)
+}
+
+/// The template for the no-highlight fallback.
+///
+/// **No erosion.** There is no glow to survive, and eroding a thin icon (a bow,
+/// a key) can leave a handful of pixels that match nothing at all. Only the
+/// quantity-badge corner is cleared, since the badge digits can differ between
+/// the market row and the shop.
+fn icon_template_plain(frame: &Frame, row: &RowReading, icfg: &IconCfg) -> Option<Template> {
+    let mut tpl = icon_template_raw(frame, row, icfg)?;
+    drop_icon_corner(&mut tpl);
     Some(tpl)
 }
 
@@ -808,11 +821,21 @@ fn prepare_icon_template(tpl: &mut Template, cfg: &BuyConfig) {
 
     // 3. Belt and braces: never compare the top-left corner, where a badge can
     //    touch the body and so survive step 2.
+    drop_icon_corner(tpl);
+}
+
+/// Clear a template's top-left corner, where a quantity badge can touch the
+/// item's body (its digits can differ between the market row and the shop).
+fn drop_icon_corner(tpl: &mut Template) {
+    let (w, h) = (tpl.width, tpl.height);
+    if w <= 0 || h <= 0 {
+        return;
+    }
     let cw = (w / 3).clamp(0, 10);
     let ch = (h / 3).clamp(0, 12);
     for y in 0..h.min(ch) {
         for x in 0..w.min(cw) {
-            tpl.mask[at(x, y)] = false;
+            tpl.mask[(y * w + x) as usize] = false;
         }
     }
 }
@@ -1550,6 +1573,63 @@ pub fn log_attempt(exe_dir: &Path, tag: &str, name: &str, price: i64, outcome: &
     }
 }
 
+/// Re-find this item's row on a freshly captured market frame.
+///
+/// Used for the *retry* after a missed Open click: re-clicking the same stale
+/// pixel can hit a row that has since moved, opening a stranger's shop. Matching
+/// by price (and name when both were read), nearest the row we scanned, finds
+/// where our offer actually is now. `None` means it is no longer on the list.
+fn relocate_row(
+    frame: &Frame,
+    tpls: &MarketTemplates,
+    market_cfg: &MarketConfig,
+    ocr: Option<&crate::ocr::Ocr>,
+    row: &RowReading,
+) -> Option<Match> {
+    let res = crate::market::scan(frame, tpls, market_cfg, ocr);
+    let mut best: Option<(i32, Match)> = None;
+    for r in &res.rows {
+        if r.read.price != row.read.price {
+            continue;
+        }
+        if !row.name.is_empty() && !r.name.is_empty() && r.name != row.name {
+            continue;
+        }
+        let d = (r.open.y - row.open.y).abs();
+        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, r.open));
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
+/// Last-resort locator: match the icon cropped from our market row against the
+/// shop, for when the game drew no highlight.
+///
+/// Strict by design — `find_all_with_error` needs every masked template pixel
+/// within `item_tolerance` — so a hit means the shop is drawing *our* item, not
+/// merely something with similar colours. An un-highlighted item is drawn
+/// cleanly, which is exactly the case the ring search can't handle.
+fn icon_fallback(shop: &Frame, market: &Frame, row: &RowReading, icfg: &IconCfg, cfg: &BuyConfig) -> Option<Match> {
+    // No highlight means no glow to survive, so match the full, un-eroded icon.
+    let tpl = icon_template_plain(market, row, icfg)?;
+    // Widen the band by the template's size: the item sits inside the crop with
+    // margins, so matching an item at the band's own edge needs the template's
+    // top-left to fall *outside* the band. Clipped to the frame on the far side.
+    let area = Rect {
+        x1: (cfg.glow_rect[0] - tpl.width).max(0),
+        y1: (cfg.glow_rect[1] - tpl.height).max(0),
+        x2: cfg.glow_rect[2] + tpl.width,
+        y2: cfg.glow_rect[3] + tpl.height,
+    };
+    let mut ms = template::find_all_with_error(shop, &tpl, area, cfg.item_tolerance, 1);
+    ms.sort_by_key(|m| m.error);
+    ms.first().map(|m| {
+        info!(x = m.x, y = m.y, w = m.w, h = m.h, error = m.error, "buy: no highlight; matched the item icon in the shop");
+        Match { x: m.x, y: m.y, w: m.w, h: m.h }
+    })
+}
+
 /// Execute one purchase, start to finish. Blocking — call it from the loop
 /// thread so nothing else is scanning or clicking meanwhile.
 ///
@@ -1564,6 +1644,8 @@ pub fn execute(
     row: &RowReading,
     verdict: &Verdict,
     tpls: &MarketTemplates,
+    market_cfg: &MarketConfig,
+    ocr: Option<&crate::ocr::Ocr>,
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
     discord_cfg: &crate::discord::DiscordConfig,
@@ -1580,7 +1662,7 @@ pub fn execute(
             tag.clone(),
         )
     });
-    let outcome = execute_inner(exe_dir, hwnd, cap, frame, row, verdict, tpls, icon_cfg, cfg, &tag);
+    let outcome = execute_inner(exe_dir, hwnd, cap, frame, row, verdict, tpls, market_cfg, ocr, icon_cfg, cfg, &tag);
     if let Some(rec) = recorder {
         let disco = discord_cfg.clone();
         let rec_name = row.name.clone();
@@ -1624,6 +1706,8 @@ fn execute_inner(
     row: &RowReading,
     verdict: &Verdict,
     tpls: &MarketTemplates,
+    market_cfg: &MarketConfig,
+    ocr: Option<&crate::ocr::Ocr>,
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
     tag: &str,
@@ -1631,6 +1715,8 @@ fn execute_inner(
     let name = row.name.clone();
     let shot = |stage: &str, f: &Frame| save_debug(exe_dir, &cfg.debug_dir, tag, stage, f);
 
+    // The icon cropped from our market row drives both locators below, so a crop
+    // that fails here is fatal to the attempt.
     if icon_template(frame, row, icon_cfg, cfg).is_none() {
         return Outcome::Failed("could not crop the item icon from the scan".into());
     }
@@ -1652,17 +1738,28 @@ fn execute_inner(
     }) {
         crate::input::set_recover_pos(rx, ry);
     }
-    crate::input::click_screen_keep(sx, sy);
-
     // 2. Wait for the seller's shop to replace the market panel. Without this
     //    the icon match finds the item sitting in the market list itself — the
     //    one place it is guaranteed to be, and never the shop we meant to buy from.
-    //    If the click missed, click Open once more before giving up.
+    //    A missed click is retried once, and the retry re-finds the row first:
+    //    the list can move during the wait, and re-clicking the stale pixel then
+    //    opens a different offer's shop.
     let mut opened = None;
     for attempt in 0..2 {
-        if attempt > 0 {
-            info!("buy: the shop did not open; clicking Open again");
+        if attempt == 0 {
             crate::input::click_screen_keep(sx, sy);
+        } else {
+            let mut retry = (sx, sy);
+            if let Ok(fresh) = cap.capture_full_client() {
+                if let Some(m) = relocate_row(&fresh, tpls, market_cfg, ocr, row) {
+                    let (mx, my) = m.center();
+                    if let Some(s) = (unsafe { crate::window::client_to_screen(hwnd, mx, my) }) {
+                        retry = s;
+                    }
+                }
+            }
+            info!(x = retry.0, y = retry.1, "buy: the shop did not open; re-finding the row and clicking Open again");
+            crate::input::click_screen_keep(retry.0, retry.1);
         }
         match wait_for(cap, cfg.shop_wait_ms, |f| shop_is_open(f, tpls, cfg.button_tolerance)) {
             Some((f, true)) => {
@@ -1680,52 +1777,43 @@ fn execute_inner(
     };
     shot("02_shop", &shop);
 
-    // 3. Find the item the shop is highlighting. The glow is the game's own
-    //    "this is what you searched for" marker, identical for every item — the
-    //    icon itself is drawn a few pixels off from the market's copy, so
-    //    comparing it pixel-for-pixel only works on a good day.
+    // 3. Find the item in the shop.
     //
-    //    If it isn't there within the window, the offer went before we got to it
-    //    — a player shop is a race. That is a normal outcome, not a failure: say
-    //    so and let the caller put us back on the offers list.
+    //    Usually the game highlights what we searched for, and that ring is the
+    //    locator: shape-agnostic, the same for every item, and immune to the few
+    //    pixels of drift between the market's copy and the shop's. But the
+    //    highlight is not always drawn — a shop reopened on the retry click can
+    //    come up without it — and then the ring search finds nothing while the
+    //    item sits plainly on screen. For that case, match the icon cropped from
+    //    our own market row: an un-highlighted item is drawn cleanly, which is
+    //    exactly when a direct match works.
     let glow_area = Rect {
         x1: cfg.glow_rect[0],
         y1: cfg.glow_rect[1],
         x2: cfg.glow_rect[2],
         y2: cfg.glow_rect[3],
     };
-    let searched = wait_for(cap, cfg.find_item_ms, |f| !glow_candidates(f, glow_area, cfg).is_empty());
-    let Some((shop, found)) = searched else {
-        return Outcome::Failed("screen capture failed while looking for the glow".into());
+    let locate = |f: &Frame| -> Option<Match> {
+        let cands = glow_candidates(f, glow_area, cfg);
+        if let Some(m) = best_candidate(f, frame, row, icon_cfg, &cands, cfg) {
+            info!(x = m.x, y = m.y, w = m.w, h = m.h, "buy: best icon match, right-clicking");
+            return Some(m);
+        }
+        icon_fallback(f, frame, row, icon_cfg, cfg)
     };
-    if !found {
+
+    let mut m = locate(&shop);
+    if m.is_none() {
+        // Nothing yet — the shop may still be drawing. Re-read once before
+        // calling the offer gone.
+        std::thread::sleep(Duration::from_millis(cfg.item_retry_ms));
+        if let Ok(f) = cap.capture_full_client() {
+            m = locate(&f);
+        }
+    }
+    let Some(m) = m else {
         shot("02_shop", &shop);
         return Outcome::Gone { name };
-    }
-    shot("02_shop", &shop);
-
-    // Collect every candidate, then pick the one whose icon actually resembles
-    // the item we scanned. If the highlight is on a different (yellow) item,
-    // the icon check rejects it rather than buying the wrong thing.
-    let mut cands = glow_candidates(&shop, glow_area, cfg);
-    if cands.is_empty() {
-        // It was there a moment ago; re-read the frame before giving up.
-        let Some((again, _)) =
-            wait_for(cap, cfg.item_retry_ms, |f| !glow_candidates(f, glow_area, cfg).is_empty())
-        else {
-            return Outcome::Failed("screen capture failed re-checking the glow".into());
-        };
-        cands = glow_candidates(&again, glow_area, cfg);
-    }
-    let m = match best_candidate(&shop, frame, row, icon_cfg, &cands, cfg) {
-        Some(m) => {
-            info!(x = m.x, y = m.y, w = m.w, h = m.h, "buy: best icon match, right-clicking");
-            m
-        }
-        None => {
-            shot("02_shop", &shop);
-            return Outcome::Gone { name };
-        }
     };
     let (ix, iy) = m.center();
     let Some((isx, isy)) = (unsafe { crate::window::client_to_screen(hwnd, ix, iy) }) else {
@@ -2336,6 +2424,41 @@ mod tests {
             g.y,
             g.w,
             g.h
+        );
+    }
+
+    /// The Craw's bow frame: the offer was already gone when the shop opened (the
+    /// shop now lists a *different* bow), so there is no highlight. The icon
+    /// fallback must not latch onto that look-alike and buy it.
+    #[test]
+    fn icon_fallback_does_not_match_an_unrelated_item() {
+        let market_p = std::path::Path::new("data/buy/1791515140771_01_market.png");
+        let shop_p = std::path::Path::new("data/buy/1791515140771_02_shop.png");
+        if !market_p.exists() || !shop_p.exists() {
+            return;
+        }
+        let market = load_frame(market_p);
+        let shop = load_frame(shop_p);
+        let mcfg = crate::market::MarketConfig::default_config();
+        let tpls = crate::market::load_templates(std::path::Path::new("Sprites")).expect("sprites");
+        let scan = crate::market::scan(&market, &tpls, &mcfg, None);
+        let Some(row) = scan.rows.first() else {
+            return;
+        };
+        let area = Rect {
+            x1: mcfg.buy.glow_rect[0],
+            y1: mcfg.buy.glow_rect[1],
+            x2: mcfg.buy.glow_rect[2],
+            y2: mcfg.buy.glow_rect[3],
+        };
+        assert!(
+            glow_candidates(&shop, area, &mcfg.buy).is_empty(),
+            "this frame is the no-highlight case"
+        );
+        let hit = icon_fallback(&shop, &market, row, &mcfg.icon, &mcfg.buy);
+        assert!(
+            hit.is_none(),
+            "the offer is gone; the fallback must not latch onto the look-alike bow: {hit:?}"
         );
     }
 

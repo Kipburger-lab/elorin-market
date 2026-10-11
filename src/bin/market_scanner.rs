@@ -308,6 +308,8 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
             &rows[i],
             &v,
             &app.tpls,
+            &app.cfg,
+            app.ocr.as_ref(),
             &app.cfg.icon,
             &app.cfg.buy,
             &app.cfg.discord,

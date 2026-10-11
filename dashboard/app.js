@@ -19,10 +19,13 @@ const WINDOWS = {
 
 const GOLD = "#ffcf5c", GREEN = "#6ee07a", RED = "#ff6b5e", BLUE = "#6fc3ff";
 
+const PAGE = 300; // item rows rendered at once
+
 const state = {
   win: "day",
   search: "",
   sort: { key: "pct", dir: -1 },
+  shown: PAGE,
   items: [],
   series: [],
   hours: [],
@@ -105,8 +108,8 @@ function matches(name) {
 }
 
 // ── Supabase REST ─────────────────────────────────────────────────────────
-async function rpc(fn, body) {
-  const res = await fetch(`${CFG.supabaseUrl}/rest/v1/rpc/${fn}`, {
+async function rpcAt(path, body) {
+  const res = await fetch(`${CFG.supabaseUrl}/rest/v1/rpc/${path}`, {
     method: "POST",
     headers: {
       apikey: CFG.anonKey,
@@ -115,8 +118,29 @@ async function rpc(fn, body) {
     },
     body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error(`${fn} → ${res.status} ${(await res.text()).slice(0, 160)}`);
+  if (!res.ok) throw new Error(`${path} → ${res.status} ${(await res.text()).slice(0, 160)}`);
   return res.json();
+}
+
+function rpc(fn, body) {
+  return rpcAt(fn, body);
+}
+
+/// Page an RPC past PostgREST's 1000-row cap.
+///
+/// A single call silently drops everything past the first 1000 rows — with ~290
+/// items and a month of buckets, `item_series` alone is tens of thousands — so
+/// the dashboard only ever saw a slice. `order` must be unique per row (`name`,
+/// or `name,b`) or the pages repeat or skip.
+async function rpcPaged(fn, body, order, page = 1000) {
+  const all = [];
+  for (let offset = 0; offset <= 200000; offset += page) {
+    const chunk = await rpcAt(`${fn}?select=*&order=${order}&limit=${page}&offset=${offset}`, body);
+    if (!chunk || !chunk.length) break;
+    all.push(...chunk);
+    if (chunk.length < page) break;
+  }
+  return all;
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────
@@ -144,8 +168,8 @@ async function load(quiet) {
   if (!quiet) setStatus("loading…");
   try {
     const [items, series, hours, recent] = await Promise.all([
-      rpc("item_stats", { since_ms: state.since }),
-      rpc("item_series", { since_ms: state.since, bucket: w.bucket }),
+      rpcPaged("item_stats", { since_ms: state.since }, "name"),
+      rpcPaged("item_series", { since_ms: state.since, bucket: w.bucket }, "name,b"),
       rpc("hour_index", { since_ms: state.since }),
       rpc("recent_offers", { lim: 200 }),
     ]);
@@ -260,7 +284,8 @@ function renderItems() {
     body.innerHTML = `<tr><td colspan="7" class="empty">no items</td></tr>`;
     return;
   }
-  body.innerHTML = list.map(i => `
+  const slice = list.slice(0, state.shown);
+  body.innerHTML = slice.map(i => `
     <tr data-name="${esc(i.name)}">
       <td><div class="itemCell">${iconTag(i.icon, 20)}<span>${hl(i.name)}</span></div></td>
       <td class="num">${fmt(i.last)}</td>
@@ -270,6 +295,13 @@ function renderItems() {
       <td class="num">${fmt(i.n)}</td>
       <td class="num ${i.pct >= 0 ? "up" : "down"}">${fmtPct(i.pct)}</td>
     </tr>`).join("");
+
+  if (list.length > slice.length) {
+    body.innerHTML += `<tr><td colspan="7" style="text-align:center">
+      <button class="ghost" id="moreItems">Show ${Math.min(PAGE, list.length - slice.length)} more
+      (${slice.length} of ${list.length})</button></td></tr>`;
+    $("moreItems").onclick = () => { state.shown += PAGE; renderItems(); };
+  }
 }
 
 function renderInsights() {
@@ -303,9 +335,22 @@ function renderInsights() {
   const busiestItem = [...state.items].sort((a, b) => b.n - a.n)[0];
   const active = state.items.filter(i => i.n >= CFG.minObservations);
   const winners = active.filter(i => i.profit > 0).length;
+  const totalOffers = state.items.reduce((a, i) => a + i.n, 0);
+
+  // Absolute-gp flips, not just percentages: a thin % on a 2b item beats a huge
+  // % on a 2k one, and the percent list alone hides that.
+  const flips = candidates().slice().sort((a, b) => b.profit - a.profit).slice(0, 6);
+  // How far an item's price swings across the window — high ÷ low.
+  const spreads = active
+    .filter(i => i.low > 0 && i.high > 0)
+    .map(i => ({ name: i.name, ratio: i.high / i.low }))
+    .sort((a, b) => b.ratio - a.ratio)
+    .slice(0, 6);
 
   el.innerHTML = `
     <div class="chips">
+      <div class="chip">offers scanned <b>${fmt(totalOffers)}</b></div>
+      <div class="chip">items <b>${fmt(state.items.length)}</b></div>
       <div class="chip">busiest hour <b>${busiest >= 0 && hourCounts[busiest] ? busiest + ":00" : "–"}</b></div>
       <div class="chip">cheapest hour <b>${cheapest >= 0 ? cheapest + ":00" : "–"}</b>${cheapest >= 0 ? ` (${fmtPct((cheapestIdx - 1) * 100)} vs typical)` : ""}</div>
       <div class="chip">most traded <b>${busiestItem ? esc(busiestItem.name) + " (" + busiestItem.n + ")" : "–"}</b></div>
@@ -313,6 +358,14 @@ function renderInsights() {
       <div class="chip">profitable items <b>${winners}/${active.length}</b></div>
     </div>
     <div class="grid2">
+      <div class="box">
+        <h3>Best flips <span class="hint">— by absolute gp, buy low → sell median</span></h3>
+        ${flipList(flips)}
+      </div>
+      <div class="box">
+        <h3>Widest spreads <span class="hint">— high ÷ low across the window</span></h3>
+        ${ratioList(spreads)}
+      </div>
       <div class="box">
         <h3>Activity by hour (offers seen)</h3>
         ${barChart(hourCounts, { color: BLUE })}
@@ -355,6 +408,24 @@ function moverList(list, up) {
     <div class="mover" data-name="${esc(m.name)}">
       <span>${esc(m.name)}</span>
       <span class="${up ? "up" : "down"}">${fmtPct(m.pct)}</span>
+    </div>`).join("") + `</div>`;
+}
+
+function flipList(list) {
+  if (!list.length) return `<div class="empty">not enough observations yet</div>`;
+  return `<div class="movers">` + list.map(m => `
+    <div class="mover" data-name="${esc(m.name)}">
+      <span>${esc(m.name)}</span>
+      <span class="up">+${fmtCompact(m.profit)} gp</span>
+    </div>`).join("") + `</div>`;
+}
+
+function ratioList(list) {
+  if (!list.length) return `<div class="empty">not enough observations yet</div>`;
+  return `<div class="movers">` + list.map(m => `
+    <div class="mover" data-name="${esc(m.name)}">
+      <span>${esc(m.name)}</span>
+      <span>${m.ratio.toFixed(1)}×</span>
     </div>`).join("") + `</div>`;
 }
 
@@ -503,11 +574,12 @@ $("tabs").addEventListener("click", e => {
   const b = e.target.closest("button[data-window]");
   if (!b) return;
   state.win = b.dataset.window;
+  state.shown = PAGE;
   document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("active", x === b));
   load();
 });
 
-$("search").addEventListener("input", e => { state.search = e.target.value; render(); });
+$("search").addEventListener("input", e => { state.search = e.target.value; state.shown = PAGE; render(); });
 $("reload").addEventListener("click", load);
 
 document.querySelector("#items thead").addEventListener("click", e => {
@@ -516,6 +588,7 @@ document.querySelector("#items thead").addEventListener("click", e => {
   const key = th.dataset.key;
   if (state.sort.key === key) state.sort.dir *= -1;
   else state.sort = { key, dir: key === "name" ? 1 : -1 };
+  state.shown = PAGE;
   document.querySelectorAll("#items th").forEach(x => { if (x.dataset.key !== key) x.textContent = x.textContent.replace(/ [▲▼]$/, ""); });
   renderItems();
 });

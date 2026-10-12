@@ -77,6 +77,12 @@ pub struct BuyConfig {
     /// the market panel, so nothing may be matched there before it's open.
     pub shop_item_rect: [i32; 4],
     /// The shop panel, searched for the glow that marks the item you looked for.
+    ///
+    /// Must cover the item grid **to its bottom edge** — a tall shop scrolls, and
+    /// a searched item on a low row is still drawn on screen. Trimming this to
+    /// the top rows is why a highlight at the bottom was never found; the header
+    /// divider and panel border it also read yellow are handled by the blob
+    /// filters, not by a short rect.
     pub glow_rect: [i32; 4],
     /// Minimum bright-yellow pixels before we call it the glow.
     pub glow_min_px: i32,
@@ -211,7 +217,7 @@ impl Default for BuyConfig {
             item_tolerance: 30,
             button_tolerance: 25,
             shop_item_rect: [40, 60, 330, 240],
-            glow_rect: [45, 85, 480, 260],
+            glow_rect: [45, 85, 500, 345],
             glow_min_px: 25,
             glow_yellowness: 100,
             glow_green_min: 40,
@@ -2424,6 +2430,36 @@ mod tests {
             g.y,
             g.w,
             g.h
+        );
+    }
+
+    /// The amulet-of-avarice frame: the highlight sat on a bottom row the old
+    /// `glow_rect` (y2 = 260) cut off, so the snipe was skipped while the item
+    /// glowed on screen. The band must reach it.
+    #[test]
+    fn finds_a_highlight_on_a_low_row() {
+        let p = std::path::Path::new("data/buy/1791755832461_02_shop.png");
+        if !p.exists() {
+            return;
+        }
+        let shop = load_frame(p);
+        let cfg = BuyConfig::default();
+        let area = Rect {
+            x1: cfg.glow_rect[0],
+            y1: cfg.glow_rect[1],
+            x2: cfg.glow_rect[2],
+            y2: cfg.glow_rect[3],
+        };
+        let cands = glow_candidates(&shop, area, &cfg);
+        eprintln!(
+            "low-row candidates: {:?}",
+            cands.iter().map(|m| (m.x, m.y, m.w, m.h)).collect::<Vec<_>>()
+        );
+        assert!(!cands.is_empty(), "the bottom-row highlight must be found");
+        let short = Rect { x1: 45, y1: 85, x2: 480, y2: 260 };
+        assert!(
+            glow_candidates(&shop, short, &cfg).is_empty(),
+            "the old short band is what missed it"
         );
     }
 

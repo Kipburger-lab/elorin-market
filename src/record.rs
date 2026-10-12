@@ -52,17 +52,31 @@ pub fn encode_with_ffmpeg(dir: &Path, tag: &str, fps: u64) -> bool {
     }
 
     // The video supersedes the frames; keeping both doubles the space for no
-    // extra information. The dir is per-recording, so this only removes ours.
+    // extra information. Remove **only our own** `<tag>_NNNN.png` frames: the
+    // run directory also holds the buy flow's annotated debug images and the
+    // timeline log, which must survive.
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "png") {
+            let ours = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| is_own_frame(n, tag));
+            if ours {
                 let _ = std::fs::remove_file(p);
             }
         }
     }
     info!(video = %out.display(), "recording encoded");
     true
+}
+
+/// Is `name` one of the frames this encode wrote (`<tag>_NNNN.png`)?
+fn is_own_frame(name: &str, tag: &str) -> bool {
+    name.strip_prefix(tag)
+        .map(|rest| rest.starts_with('_'))
+        .unwrap_or(false)
+        && name.ends_with(".png")
 }
 
 /// Captures the client to `<dir>/<tag>_NNNN.png` on a background thread until
@@ -121,5 +135,24 @@ impl Recorder {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_only_matches_the_recorders_own_frames() {
+        let tag = "1791827071644";
+        assert!(is_own_frame("1791827071644_0000.png", tag));
+        assert!(is_own_frame("1791827071644_1234.png", tag));
+        // The run directory's other artifacts must be left alone.
+        assert!(!is_own_frame("01_market.png", tag));
+        assert!(!is_own_frame("02_locate.png", tag));
+        assert!(!is_own_frame("1791827071644.mp4", tag));
+        assert!(!is_own_frame("1791827071644.log", tag));
+        // A different run's frames are not ours either.
+        assert!(!is_own_frame("1791827000000_0001.png", tag));
     }
 }

@@ -26,6 +26,8 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Com",
+    # Local wall-clock timestamps for the run logs.
+    "Win32_System_SystemInformation",
     # Built-in Windows OCR (Windows.Media.Ocr) for item names.
     "Foundation",
     "Foundation_Collections",

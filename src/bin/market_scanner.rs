@@ -145,6 +145,16 @@ fn run() -> Result<()> {
         warn!("cloud.enable is set but cloud.url / cloud.service_key is missing");
     }
 
+    // Prune old footage and logs once, at startup, on a background thread, so an
+    // overnight run can never hoard storage.
+    if cfg.storage.enable {
+        println!(
+            "  storage: caps {} MB footage / {} MB logs",
+            cfg.storage.footage_cap_mb, cfg.storage.log_cap_mb
+        );
+    }
+    elorin_bot::storage::spawn_cleaner(exe_dir.clone(), cfg.storage.clone());
+
     let _ = APP.set(App {
         cfg: cfg.clone(),
         tpls,
@@ -290,13 +300,18 @@ fn log_rows(result: &ScanResult) {
 /// means "don't store the whole list as changes"; an armed item already on
 /// screen when the scanner starts is every bit as buyable as one that arrives
 /// later, and no "the list changed" signal ever fires for it.
-fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowReading]) {
+///
+/// Returns true when a purchase was **attempted** (bought or gone, not a hard
+/// failure). A buy usually leaves the rest of the list unchanged, so the caller
+/// then rescans at once — a second eligible item can still be sitting there, and
+/// waiting for a "the list changed" signal it will never get would miss it.
+fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowReading]) -> bool {
     elorin_bot::buy::report(rows);
     if app.cfg.buy.dry_run {
-        return;
+        return false;
     }
     // At most one purchase per pass: clicking Open replaces the offers list, so
-    // we buy, then let the next iteration rescan.
+    // we buy, then let the next pass rescan.
     let next = elorin_bot::buy::plan(rows).into_iter().next();
     if let Some((i, v)) = next {
         set_status(&format!("BUYING {} @ {}", v.name, v.price));
@@ -317,11 +332,14 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
         println!("  {}", outcome.describe());
         info!(outcome = %outcome.describe(), "auto-buy");
         set_status(&outcome.describe());
+        let attempted = outcome.attempted();
         // The **returning state**, run on every attempt — bought, gone, or
         // aborted half-way. It is what guarantees the client is back somewhere
         // the scanning state can recognise before the loop resumes.
         elorin_bot::buy::return_to_offers(&app.exe_dir, hwnd, cap, &app.tpls, &app.cfg.buy);
+        return attempted;
     }
+    false
 }
 
 /// A cheap fingerprint of a frame, to notice when the picture changes.
@@ -419,10 +437,37 @@ fn loop_thread() {
     // usually just closed, not broken.
     const REOPEN_AFTER: u32 = 4;
     let mut stuck: u32 = 0;
+    // Liveness/visibility. The loop is event-driven — it only *scans* when the
+    // offers list changes after a Refresh, and is otherwise silent — so a quiet
+    // market looks exactly like a dead loop. These counters make its activity
+    // (and any pause) visible in the log and console.
+    let mut passes: u64 = 0;
+    let mut scans: u64 = 0;
+    let mut last_beat = Instant::now();
+    // Set after a purchase: the list is often unchanged by a buy, so rescan at
+    // once to catch a second eligible item. `streak` bounds the chaining so a
+    // persistently failing item can't spin the loop.
+    let mut force_scan = false;
+    let mut force_streak = 0u32;
+    // The watch-region signature of the last list we *scanned*. Changes are
+    // detected against this, not a fresh baseline per pass: a per-pass baseline
+    // silently absorbs an update that rendered between passes (its poll then sees
+    // no change), so a new row could sit unnoticed until something else moved.
+    let mut last_watch: Option<u64> = None;
+    // The rows from the last scan, so an eligible item can be acted on even when
+    // the list doesn't change (see the no-change branch).
+    let mut last_rows: Vec<RowReading> = Vec::new();
 
     while !EXIT_REQUESTED.load(Ordering::Relaxed) {
         // Tell the manager we're alive and which mode we're in (throttled).
         elorin_bot::buy::maybe_heartbeat();
+        if last_beat.elapsed() >= Duration::from_secs(10) {
+            if LOOP_ACTIVE.load(Ordering::SeqCst) {
+                let status = state().lock().status.clone();
+                info!(passes, scans, %status, "loop: heartbeat");
+            }
+            last_beat = Instant::now();
+        }
 
         if !LOOP_ACTIVE.load(Ordering::SeqCst) {
             if seeded {
@@ -461,6 +506,7 @@ fn loop_thread() {
             continue;
         }
 
+        passes += 1;
         let cap = GdiCapturer::new(hwnd);
         // Keep the OS pointer off the panel for every capture this pass.
         park_cursor(hwnd, &app.cfg);
@@ -472,103 +518,156 @@ fn loop_thread() {
                 let r = market::scan(&f, &app.tpls, &app.cfg, app.ocr.as_ref());
                 prev = r.rows.iter().map(market::row_key).collect();
                 seeded = true;
+                last_watch = Some(market::signature(&f, app.cfg.watch));
                 // Check what's already on screen before seeding ends the pass:
                 // the opening scan is often the most useful one.
-                try_buy(&app, hwnd, &cap, &f, &r.rows);
+                force_scan = try_buy(&app, hwnd, &cap, &f, &r.rows);
+                last_rows = r.rows.clone();
                 set_result(r, "loop seeded - refreshing");
             }
             continue;
         }
 
-        // 1. Click Refresh.
-        let full = match cap.capture_full_client() {
-            Ok(f) => f,
-            Err(e) => {
-                set_status(&format!("capture failed: {e}"));
-                std::thread::sleep(Duration::from_millis(300));
-                continue;
-            }
-        };
-        match market::find_refresh(&full, &app.tpls, app.cfg.refresh.tolerance) {
-            Some(m) => {
-                stuck = 0;
-                let (cx, cy) = m.center();
-                match unsafe { window::client_to_screen(hwnd, cx, cy) } {
-                    Some((sx, sy)) => {
-                        input::click_screen(sx, sy);
-                        // Lift the pointer off the button the instant the click
-                        // lands, so its sprite is back before the next find.
-                        park_cursor(hwnd, &app.cfg);
-                    }
-                    None => {
-                        warn!("client_to_screen failed for refresh");
-                        std::thread::sleep(Duration::from_millis(300));
-                        continue;
-                    }
+        // After a purchase the offers list is usually *unchanged*, yet a second
+        // eligible item can still be sitting on it — so rescan at once rather
+        // than wait for a change a quiet list will never produce. Bounded so a
+        // persistently failing item can't spin the loop.
+        let forced = force_scan && force_streak < 5;
+        force_scan = false;
+        if forced {
+            force_streak += 1;
+            info!(streak = force_streak, "loop: rescanning the list after a purchase");
+        } else {
+            force_streak = 0;
+
+            // 1. Click Refresh.
+            let full = match cap.capture_full_client() {
+                Ok(f) => f,
+                Err(e) => {
+                    set_status(&format!("capture failed: {e}"));
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
                 }
-            }
-            None => {
-                set_status("loop: Refresh button not found");
-                stuck += 1;
-                // The client drops out of the market window when a purchase
-                // empties a shop or the buy is refused. Before recording that as
-                // a stuck episode, try to put the offers list back: click
-                // "View Recent Offers" if the market is on another page, or
-                // reopen the market through a clerk if it closed entirely.
-                if stuck >= REOPEN_AFTER {
-                    if elorin_bot::buy::recover_market(hwnd, &cap, &app.tpls, &app.cfg.buy) {
-                        info!("loop: market recovery attempted; rescanning");
-                        stuck = 0;
-                        std::thread::sleep(Duration::from_millis(500));
-                        continue;
-                    }
-                }
-                // Not recoverable and not moving: record a window of the client
-                // so whatever happened can be reviewed afterwards. Once per
-                // episode, not on every pass.
-                if stuck == STUCK_AFTER {
-                    let video = record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
-                    elorin_bot::discord::notify_stuck(app.cfg.discord.clone(), video);
+            };
+            match market::find_refresh(&full, &app.tpls, app.cfg.refresh.tolerance) {
+                Some(m) => {
                     stuck = 0;
+                    let (cx, cy) = m.center();
+                    match unsafe { window::client_to_screen(hwnd, cx, cy) } {
+                        Some((sx, sy)) => {
+                            input::click_screen(sx, sy);
+                            // Lift the pointer off the button the instant the click
+                            // lands, so its sprite is back before the next find.
+                            park_cursor(hwnd, &app.cfg);
+                        }
+                        None => {
+                            warn!("client_to_screen failed for refresh");
+                            std::thread::sleep(Duration::from_millis(300));
+                            continue;
+                        }
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(300));
+                None => {
+                    set_status("loop: Refresh button not found");
+                    stuck += 1;
+                    // The client drops out of the market window when a purchase
+                    // empties a shop or the buy is refused. Before recording that as
+                    // a stuck episode, try to put the offers list back: click
+                    // "View Recent Offers" if the market is on another page, or
+                    // reopen the market through a clerk if it closed entirely.
+                    if stuck >= REOPEN_AFTER {
+                        if elorin_bot::buy::recover_market(hwnd, &cap, &app.tpls, &app.cfg.buy) {
+                            info!("loop: market recovery attempted; rescanning");
+                            stuck = 0;
+                            std::thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                    }
+                    // Not recoverable and not moving: record a window of the client
+                    // so whatever happened can be reviewed afterwards. Once per
+                    // episode, not on every pass.
+                    if stuck == STUCK_AFTER {
+                        let video = record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
+                        elorin_bot::discord::notify_stuck(app.cfg.discord.clone(), video);
+                        stuck = 0;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+            }
+
+            // 2. Poll the watch region until it changes (or the timeout expires).
+            //    No change means the refresh brought nothing new, so the loop clicks
+            //    Refresh again and this window is what paces the idle refresh rate:
+            //    a shorter window refreshes more often, but must still be long enough
+            //    for a render to land, or the change is missed and clicked over.
+            let wr = market::watch_rect(&app.cfg.watch);
+            // Compare against the last state we *scanned* (not a fresh baseline),
+            // so an update that rendered between passes is still caught on the
+            // next poll instead of being absorbed.
+            if last_watch.is_none() {
+                last_watch = cap
+                    .capture_region(wr)
+                    .ok()
+                    .map(|f| market::signature(&f, app.cfg.watch));
+            }
+            let poll = Duration::from_millis(app.cfg.refresh.poll_ms.max(1));
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(app.cfg.refresh.timeout_ms);
+            let mut changed = false;
+            while Instant::now() < deadline
+                && LOOP_ACTIVE.load(Ordering::SeqCst)
+                && !EXIT_REQUESTED.load(Ordering::Relaxed)
+            {
+                std::thread::sleep(poll);
+                if let Ok(f) = cap.capture_region(wr) {
+                    let sig = market::signature(&f, app.cfg.watch);
+                    if Some(sig) != last_watch {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+
+            if !changed {
+                debug!(ms = started.elapsed().as_millis() as u64, "refresh window closed with no change");
+                // Nothing changed, but an eligible item can still be sitting on
+                // the list — one armed mid-run, or a purchase that failed. Act on
+                // the last scan, so it is always bought, change or not.
+                if !last_rows.is_empty() {
+                    if let Ok(f) = cap.capture_full_client() {
+                        force_scan = try_buy(&app, hwnd, &cap, &f, &last_rows);
+                    }
+                }
+                set_status("loop: no change in time - refreshing again");
                 continue;
             }
-        }
 
-        // 2. Poll the watch region until it changes (or the timeout expires).
-        //    No change means the refresh brought nothing new, so the loop clicks
-        //    Refresh again and this window is what paces the idle refresh rate:
-        //    a shorter window refreshes more often, but must still be long enough
-        //    for a render to land, or the change is missed and clicked over.
-        let wr = market::watch_rect(&app.cfg.watch);
-        let baseline = match cap.capture_region(wr) {
-            Ok(f) => market::signature(&f, app.cfg.watch),
-            Err(_) => continue,
-        };
-        let poll = Duration::from_millis(app.cfg.refresh.poll_ms.max(1));
-        let started = Instant::now();
-        let deadline = started + Duration::from_millis(app.cfg.refresh.timeout_ms);
-        let mut changed = false;
-        while Instant::now() < deadline
-            && LOOP_ACTIVE.load(Ordering::SeqCst)
-            && !EXIT_REQUESTED.load(Ordering::Relaxed)
-        {
-            std::thread::sleep(poll);
-            if let Ok(f) = cap.capture_region(wr) {
-                if market::signature(&f, app.cfg.watch) != baseline {
-                    changed = true;
-                    break;
+            // The first change can be a half-drawn list (a new offer sliding in),
+            // and scanning that partial render misses the item until the next
+            // refresh. Read until the region holds still for two polls before
+            // scanning: cheap when the list is settled, bounded when it is not.
+            let settle_ms = app.cfg.refresh.settle_ms.max(1);
+            let settle_deadline = Instant::now() + Duration::from_millis(settle_ms);
+            let mut last = last_watch.unwrap_or(0);
+            let mut stable = 0u32;
+            while Instant::now() < settle_deadline && stable < 2 {
+                std::thread::sleep(poll);
+                if let Ok(f) = cap.capture_region(wr) {
+                    let sig = market::signature(&f, app.cfg.watch);
+                    if sig == last {
+                        stable += 1;
+                    } else {
+                        stable = 0;
+                    }
+                    last = sig;
                 }
             }
-        }
 
-        if !changed {
-            debug!(ms = started.elapsed().as_millis() as u64, "refresh window closed with no change");
-            set_status("loop: no change in time - refreshing again");
-            continue;
+            debug!(ms = started.elapsed().as_millis() as u64, "refresh changed");
+            scans += 1;
+            info!(scans, ms = started.elapsed().as_millis() as u64, "loop: offers list changed; scanning");
         }
-        debug!(ms = started.elapsed().as_millis() as u64, "refresh changed");
 
         // 3. A change landed: full scan and store only the new rows.
         let full = match cap.capture_full_client() {
@@ -576,7 +675,13 @@ fn loop_thread() {
             Err(_) => continue,
         };
         let r = market::scan(&full, &app.tpls, &app.cfg, app.ocr.as_ref());
-        try_buy(&app, hwnd, &cap, &full, &r.rows);
+        // The list we just read is the new "last seen" state.
+        last_watch = Some(market::signature(&full, app.cfg.watch));
+        last_rows = r.rows.clone();
+        // Print the same "scan: N rows … price=…" listing F8 does, so the loop
+        // visibly scans the prices on the console — not just the new rows.
+        log_rows(&r);
+        force_scan = try_buy(&app, hwnd, &cap, &full, &r.rows);
         // Keep the frame we actually read, so a wrong reading can be diagnosed
         // later (the loop doesn't otherwise write a frame).
         let _ = market::save_frame_png(&app.exe_dir.join(&app.cfg.output.frame), &full);

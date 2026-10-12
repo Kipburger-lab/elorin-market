@@ -9,6 +9,7 @@
 //! - `hotkeys`  — low-level keyboard hook that consumes keys only while focused.
 //! - `market`   — market price reading (Open buttons + digit OCR, ABI-style).
 
+pub mod annotate;
 pub mod buy;
 pub mod capture;
 pub mod cloud;
@@ -19,7 +20,9 @@ pub mod market;
 pub mod ocr;
 pub mod overlay;
 pub mod record;
+pub mod runlog;
 pub mod search;
+pub mod storage;
 pub mod window;
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -52,6 +52,9 @@ pub struct MarketConfig {
     /// Optional Discord webhook notifications for purchases / stuck states.
     #[serde(default)]
     pub discord: crate::discord::DiscordConfig,
+    /// Cap-based cleanup of old footage and logs at startup.
+    #[serde(default)]
+    pub storage: crate::storage::StorageConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -247,6 +250,16 @@ pub struct RefreshCfg {
     pub timeout_ms: u64,
     /// Per-channel tolerance for matching Refresh.png.
     pub tolerance: u8,
+    /// After a change is seen, wait until the watch region holds still for two
+    /// polls before scanning — the first change can be a half-drawn list, and
+    /// scanning that partial render misses the item until the next refresh.
+    /// This is the ceiling on that wait; it returns the moment the render settles.
+    #[serde(default = "default_settle_ms")]
+    pub settle_ms: u64,
+}
+
+fn default_settle_ms() -> u64 {
+    200
 }
 
 impl Default for RefreshCfg {
@@ -255,6 +268,7 @@ impl Default for RefreshCfg {
             poll_ms: 5,
             timeout_ms: 2000,
             tolerance: 25,
+            settle_ms: 200,
         }
     }
 }
@@ -335,6 +349,7 @@ impl MarketConfig {
             cloud: crate::cloud::CloudConfig::default(),
             buy: crate::buy::BuyConfig::default(),
             discord: crate::discord::DiscordConfig::default(),
+            storage: crate::storage::StorageConfig::default(),
             output: OutputCfg {
                 file: "data/market_prices.json".to_string(),
                 history: "data/market_history.jsonl".to_string(),

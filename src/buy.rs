@@ -7,7 +7,7 @@
 //! Rules live in Supabase (`watchlist` + `buy_settings`); the manager page owns
 //! them. The scanner only ever reads.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::HWND;
 
+use crate::annotate::{self, Stroke};
 use crate::capture::gdi::GdiCapturer;
 use crate::capture::{Frame, Rect};
 use crate::market::{IconCfg, MarketConfig, MarketTemplates, RowReading};
+use crate::runlog::RunLog;
 use crate::search::template::{self, Template};
 use crate::search::Match;
 
@@ -217,7 +219,7 @@ impl Default for BuyConfig {
             item_tolerance: 30,
             button_tolerance: 25,
             shop_item_rect: [40, 60, 330, 240],
-            glow_rect: [45, 85, 500, 345],
+            glow_rect: [24, 84, 503, 348],
             glow_min_px: 25,
             glow_yellowness: 100,
             glow_green_min: 40,
@@ -226,7 +228,7 @@ impl Default for BuyConfig {
             glow_max_size: 40,
             glow_min_size: 16,
             glow_max_fill: 1.0,
-            icon_profile_max_dist: 0.0,
+            icon_profile_max_dist: 25.0,
             menu_radius: 140,
             recover_client: [629, 265],
             menu_settle_ms: 150,
@@ -1375,19 +1377,94 @@ fn market_is_back(frame: &Frame, tpls: &MarketTemplates, tol: u8) -> bool {
         || tpls.refresh.as_ref().map(|r| template::find(frame, r, tol).is_some()).unwrap_or(false)
 }
 
-fn save_debug(exe_dir: &Path, sub: &str, tag: &str, stage: &str, frame: &Frame) {
-    if sub.trim().is_empty() {
+/// The client-space rect of a template match.
+fn rect_of(m: Match) -> Rect {
+    Rect {
+        x1: m.x,
+        y1: m.y,
+        x2: m.x + m.w,
+        y2: m.y + m.h,
+    }
+}
+
+/// Save an (optionally annotated) debug frame to `<debug_dir>/<run_id>/<stage>.png`.
+///
+/// Everything a run produces — the annotated frames, the recording, and the
+/// timeline `.log` — lives under one run-ID directory, so a finished run is a
+/// single folder to open when something has to be explained.
+fn save_debug(exe_dir: &Path, sub: &str, run_id: &str, stage: &str, frame: &Frame, strokes: &[Stroke]) {
+    if sub.trim().is_empty() || run_id.is_empty() {
         return;
     }
-    let dir = exe_dir.join(sub);
+    // Frames live in a `frames/` subdir of the run so the recorder's own
+    // `<run_id>_NNNN.png` frames (and its cleanup) never touch them.
+    let dir = exe_dir.join(sub).join(run_id).join("frames");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(error = %e, "could not create the buy debug dir");
         return;
     }
-    let path = dir.join(format!("{tag}_{stage}.png"));
-    match crate::market::save_frame_png(&path, frame) {
+    let path = dir.join(format!("{stage}.png"));
+    let image = if strokes.is_empty() {
+        frame.clone()
+    } else {
+        annotate::annotated(frame, strokes)
+    };
+    match crate::market::save_frame_png(&path, &image) {
         Ok(()) => info!(path = %path.display(), "buy debug frame"),
         Err(e) => warn!(error = %e, "could not save a buy debug frame"),
+    }
+}
+
+/// The annotated frames for a run, in stage order, capped at `max`.
+fn collect_pngs(dir: &Path, max: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+        .collect();
+    out.sort();
+    out.truncate(max.max(1));
+    out
+}
+
+/// Build the Discord summary for a finished run.
+fn run_summary(
+    id: &str,
+    row: &RowReading,
+    verdict: &Verdict,
+    outcome: &Outcome,
+    elapsed_ms: u128,
+) -> crate::discord::RunSummary {
+    let (title, color) = match outcome {
+        Outcome::Bought { units, buy_x, .. } => (
+            format!(
+                "Bought {units} × {} ({})",
+                row.name,
+                if *buy_x { "Buy X" } else { "Buy 1" }
+            ),
+            if verdict.snipe { 0xFFD700 } else { 0x2ECC71 },
+        ),
+        Outcome::Gone { .. } => (format!("{} gone before buying", row.name), 0x3498DB),
+        Outcome::Failed(_) => (format!("{} aborted", row.name), 0xE74C3C),
+    };
+    let units = match outcome {
+        Outcome::Bought { units, .. } => *units,
+        _ => 0,
+    };
+    crate::discord::RunSummary {
+        id: id.to_string(),
+        name: row.name.clone(),
+        title,
+        outcome: outcome.describe(),
+        color,
+        price: verdict.price,
+        units,
+        max_price: verdict.max_price,
+        elapsed_ms,
+        snipe: verdict.snipe,
     }
 }
 
@@ -1547,9 +1624,10 @@ pub fn return_to_offers(
 /// Append one line to `data/purchases.jsonl`.
 ///
 /// The scanner runs unattended, so this is the only way to review what it did —
-/// and to catch a junk purchase after the fact. Each line names the debug `tag`,
-/// which is how the screenshots for that attempt are found afterwards:
-/// `data/buy/<tag>_01_market.png`, `_02_shop.png`, `_03_menu.png`.
+/// and to catch a junk purchase after the fact. Each line names the run `tag`,
+/// which is also the folder holding that attempt's evidence:
+/// `data/buy/<tag>/` with the annotated `NN_*.png` frames, the `<tag>.mp4`
+/// recording, and the timestamped `<tag>.log` timeline.
 pub fn log_attempt(exe_dir: &Path, tag: &str, name: &str, price: i64, outcome: &Outcome) {
     let (units, result) = match outcome {
         Outcome::Bought { units, buy_x, .. } => (*units, if *buy_x { "buy_x" } else { "buy_1" }),
@@ -1656,7 +1734,20 @@ pub fn execute(
     cfg: &BuyConfig,
     discord_cfg: &crate::discord::DiscordConfig,
 ) -> Outcome {
+    // One ID for the whole run: it names the footage dir, every debug frame, the
+    // timeline log, and the Discord posts, so any artifact can be tied back to
+    // this attempt later.
     let tag = crate::market::now_ms().to_string();
+    let run = RunLog::new(&tag);
+    run.context("item", &row.name);
+    run.context("price", verdict.price.to_string());
+    run.context("max price", verdict.max_price.to_string());
+    run.context(
+        "session",
+        format!("qty_limit {} / bought {}", verdict.qty_limit, verdict.bought),
+    );
+    run.step("start", format!("buy attempt for \"{}\" @ {}", row.name, verdict.price));
+
     // Record the whole attempt — from just before the shop is opened until the
     // purchase lands — so a wrong buy can be reviewed, not guessed at. The dir
     // is per-attempt so encoding never touches another attempt's frames.
@@ -1668,24 +1759,63 @@ pub fn execute(
             tag.clone(),
         )
     });
-    let outcome = execute_inner(exe_dir, hwnd, cap, frame, row, verdict, tpls, market_cfg, ocr, icon_cfg, cfg, &tag);
+    let outcome = execute_inner(
+        exe_dir, hwnd, cap, frame, row, verdict, tpls, market_cfg, ocr, icon_cfg, cfg, &tag, &run,
+    );
+
+    match &outcome {
+        Outcome::Bought { .. } => run.step("result", outcome.describe()),
+        Outcome::Gone { .. } => run.warn("result", outcome.describe()),
+        Outcome::Failed(_) => run.fail("result", outcome.describe()),
+    }
+    let elapsed_ms = run.elapsed_ms();
+    let log_text = run.render();
+    let timeline = run.timeline(1500);
+
+    // Persist the timeline next to the footage; this is the artifact to read when
+    // a run has to be explained.
+    let run_dir = exe_dir.join(&cfg.debug_dir).join(&tag);
+    if !cfg.debug_dir.trim().is_empty() {
+        let written = std::fs::create_dir_all(&run_dir)
+            .and_then(|_| std::fs::write(run_dir.join(format!("{tag}.log")), &log_text));
+        if let Err(e) = written {
+            warn!(error = %e, "could not write the run log");
+        }
+    }
+
+    // The item icon, shared by the summary post and the purchase embed.
+    let icon_png = crate::market::crop_icon(frame, &row.open, icon_cfg)
+        .and_then(|(w, h, rgba)| crate::discord::encode_icon_png(w, h, &rgba));
+    let summary = run_summary(&tag, row, verdict, &outcome, elapsed_ms);
+
+    // Summary channel: a short, skimmable index entry (headline + run ID + icon).
+    crate::discord::notify_summary(discord_cfg.clone(), summary.clone(), icon_png.clone());
+
+    // Post the evidence (timeline + annotated images) and, when recorded, the
+    // video. Both messages carry the same run ID.
     if let Some(rec) = recorder {
         let disco = discord_cfg.clone();
-        let rec_name = row.name.clone();
-        // Encode on its own thread: the timed clicks that follow must not wait on
-        // an ffmpeg run. The MP4 is then posted to Discord for review.
-        std::thread::spawn(move || match rec.stop() {
-            Some(p) => {
-                info!(path = %p.display(), "buy: purchase recording saved");
-                crate::discord::notify_purchase_video(disco, rec_name, p);
+        let images_dir = run_dir.join("frames");
+        let summary = summary.clone();
+        // Encode on its own thread: the next pass must not wait on an ffmpeg run.
+        std::thread::spawn(move || {
+            let video = rec.stop();
+            match &video {
+                Some(p) => info!(path = %p.display(), "buy: purchase recording saved"),
+                None => warn!("buy: purchase recording could not be encoded"),
             }
-            None => warn!("buy: purchase recording could not be encoded"),
+            if disco.send_runs {
+                let images = collect_pngs(&images_dir, disco.max_images);
+                crate::discord::notify_run(disco, summary, log_text, timeline, images, video);
+            }
         });
+    } else if discord_cfg.send_runs {
+        let images = collect_pngs(&run_dir.join("frames"), discord_cfg.max_images);
+        crate::discord::notify_run(discord_cfg.clone(), summary, log_text, timeline, images, None);
     }
+
     if let Outcome::Bought { units, .. } = outcome {
         if discord_cfg.is_configured() {
-            let icon_png = crate::market::crop_icon(frame, &row.open, icon_cfg)
-                .and_then(|(w, h, rgba)| crate::discord::encode_icon_png(w, h, &rgba));
             crate::discord::notify_purchase(
                 discord_cfg.clone(),
                 verdict.name.clone(),
@@ -1717,23 +1847,78 @@ fn execute_inner(
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
     tag: &str,
+    run: &RunLog,
 ) -> Outcome {
     let name = row.name.clone();
-    let shot = |stage: &str, f: &Frame| save_debug(exe_dir, &cfg.debug_dir, tag, stage, f);
+    let shot = |stage: &str, f: &Frame, strokes: &[Stroke]| {
+        save_debug(exe_dir, &cfg.debug_dir, tag, stage, f, strokes)
+    };
 
     // The icon cropped from our market row drives both locators below, so a crop
     // that fails here is fatal to the attempt.
-    if icon_template(frame, row, icon_cfg, cfg).is_none() {
+    let Some(icon_tpl) = icon_template(frame, row, icon_cfg, cfg) else {
+        run.fail("crop", "could not crop the item icon from the scan");
         return Outcome::Failed("could not crop the item icon from the scan".into());
-    }
-    shot("01_market", frame);
+    };
+    run.note(
+        "crop",
+        format!(
+            "icon template {}x{} cropped from the market row",
+            icon_tpl.width, icon_tpl.height
+        ),
+    );
+    shot(
+        "01_market",
+        frame,
+        &[
+            Stroke::new(rect_of(row.open), annotate::MAGENTA, 2),
+            Stroke::new(row.band, annotate::CYAN, 1),
+            Stroke::new(crate::market::icon_region(&row.open, icon_cfg), annotate::ORANGE, 1),
+        ],
+    );
+
+    // The shop's item band, defined up front so both the shop-open shot and the
+    // locator below can annotate it.
+    let glow_area = Rect {
+        x1: cfg.glow_rect[0],
+        y1: cfg.glow_rect[1],
+        x2: cfg.glow_rect[2],
+        y2: cfg.glow_rect[3],
+    };
 
     // 1. Open the seller's shop on this row.
+    //
+    // The list can re-render between the scan and this click — a new offer
+    // shuffles the rows down — so the pixel our row sat on may now be a
+    // different item. Re-find the row on a fresh frame first (price-anchored, no
+    // OCR) and click *that* Open button; if the row is gone, abort rather than
+    // open a stranger's shop on a stale coordinate. A false miss is harmless —
+    // the caller rescans and retries.
     let (cx, cy) = row.open.center();
-    let Some((sx, sy)) = (unsafe { crate::window::client_to_screen(hwnd, cx, cy) }) else {
+    let mut target = (cx, cy);
+    if let Ok(fresh) = cap.capture_full_client() {
+        match relocate_row(&fresh, tpls, market_cfg, None, row) {
+            Some(m) => {
+                let (mx, my) = m.center();
+                target = (mx, my);
+                if (mx, my) != (cx, cy) {
+                    info!(from_x = cx, from_y = cy, to_x = mx, to_y = my, "buy: the row moved; clicking its new position");
+                    run.note("open", format!("row moved from ({cx},{cy}) to ({mx},{my}); clicking the verified position"));
+                } else {
+                    run.note("open", format!("row verified in place at ({cx},{cy})"));
+                }
+            }
+            None => {
+                run.warn("open", "the offer left the list before we could click Open");
+                return Outcome::Gone { name };
+            }
+        }
+    }
+    let Some((sx, sy)) = (unsafe { crate::window::client_to_screen(hwnd, target.0, target.1) }) else {
         return Outcome::Failed("client_to_screen failed for the Open button".into());
     };
     info!(name = %name, price = verdict.price, "buy: clicking Open");
+    run.step("open", format!("clicking Open at ({},{})", target.0, target.1));
     // The pointer has to stay put through the whole purchase (menus track it),
     // so remember where the operator had it and put it back at the end.
     let cursor = crate::input::cursor_pos();
@@ -1765,6 +1950,7 @@ fn execute_inner(
                 }
             }
             info!(x = retry.0, y = retry.1, "buy: the shop did not open; re-finding the row and clicking Open again");
+            run.warn("open", "the shop did not open; re-finding the row and clicking Open again");
             crate::input::click_screen_keep(retry.0, retry.1);
         }
         match wait_for(cap, cfg.shop_wait_ms, |f| shop_is_open(f, tpls, cfg.button_tolerance)) {
@@ -1776,12 +1962,17 @@ fn execute_inner(
         }
     }
     let Some(shop) = opened else {
+        run.fail(
+            "shop",
+            format!("the shop did not open within {}ms over two tries", cfg.shop_wait_ms),
+        );
         return Outcome::Failed(format!(
             "the shop did not open within {}ms over two tries",
             cfg.shop_wait_ms
         ));
     };
-    shot("02_shop", &shop);
+    run.step("shop", "seller's shop open; locating the item");
+    shot("02_shop", &shop, &[Stroke::new(glow_area, annotate::YELLOW, 1)]);
 
     // 3. Find the item in the shop.
     //
@@ -1793,12 +1984,6 @@ fn execute_inner(
     //    item sits plainly on screen. For that case, match the icon cropped from
     //    our own market row: an un-highlighted item is drawn cleanly, which is
     //    exactly when a direct match works.
-    let glow_area = Rect {
-        x1: cfg.glow_rect[0],
-        y1: cfg.glow_rect[1],
-        x2: cfg.glow_rect[2],
-        y2: cfg.glow_rect[3],
-    };
     let locate = |f: &Frame| -> Option<Match> {
         let cands = glow_candidates(f, glow_area, cfg);
         if let Some(m) = best_candidate(f, frame, row, icon_cfg, &cands, cfg) {
@@ -1812,15 +1997,26 @@ fn execute_inner(
     if m.is_none() {
         // Nothing yet — the shop may still be drawing. Re-read once before
         // calling the offer gone.
+        run.note("locate", "no item found on the first read; re-reading the shop");
         std::thread::sleep(Duration::from_millis(cfg.item_retry_ms));
         if let Ok(f) = cap.capture_full_client() {
             m = locate(&f);
         }
     }
     let Some(m) = m else {
-        shot("02_shop", &shop);
+        run.warn("locate", "the item is no longer highlighted or matchable; calling the offer gone");
+        shot("02_shop", &shop, &[Stroke::new(glow_area, annotate::YELLOW, 1)]);
         return Outcome::Gone { name };
     };
+    run.step("locate", format!("item located at ({},{}) {}x{}", m.x, m.y, m.w, m.h));
+    shot(
+        "02_locate",
+        &shop,
+        &[
+            Stroke::new(glow_area, annotate::YELLOW, 1),
+            Stroke::new(rect_of(m), annotate::GREEN, 2),
+        ],
+    );
     let (ix, iy) = m.center();
     let Some((isx, isy)) = (unsafe { crate::window::client_to_screen(hwnd, ix, iy) }) else {
         return Outcome::Failed("client_to_screen failed for the item".into());
@@ -1865,9 +2061,10 @@ fn execute_inner(
 
     let units: i64 = if fast_bulk {
         info!(stack, take = bulk_take, bulk = cfg.bulk_shift_below, "buy: shift-clicking the stack");
+        run.step("buy", format!("shift-clicking {bulk_take} of a {stack} stack (fast path)"));
         crate::input::shift_click_screen_keep(isx, isy);
         std::thread::sleep(Duration::from_millis(250));
-        shot("05_after", &shop);
+        shot("05_after", &shop, &[]);
         bulk_take
     } else {
         // Right-click the item, then wait for the menu. The click can land before
@@ -1879,6 +2076,7 @@ fn execute_inner(
         // as it is *complete* (both Buy 1 and Buy X visible), rather than being made
         // to wait out a fixed sleep. That is both quicker and stricter than a sleep:
         // it clicks the instant the entries are all there, and never before.
+        run.step("menu", format!("right-clicking the item for {label}"));
         crate::input::right_click_screen_keep(isx, isy);
         const MENU_POLL_MS: u64 = 5;
         let mut menu = None;
@@ -1892,7 +2090,7 @@ fn execute_inner(
                 }
                 other => {
                     if let Some((last, _)) = other {
-                        shot("03_rc", &last);
+                        shot("03_rc", &last, &[Stroke::new(near, annotate::YELLOW, 1)]);
                     }
                     if attempt == 0 {
                         // Move the pointer clear *before* clicking again: if a menu
@@ -1907,6 +2105,7 @@ fn execute_inner(
                             break;
                         }
                         info!("buy: no menu after the right-click; clicking it once more");
+                        run.warn("menu", "no menu after the right-click; clicking once more");
                         crate::input::right_click_screen_keep(isx, isy);
                     }
                 }
@@ -1916,12 +2115,21 @@ fn execute_inner(
         match menu {
             Some((menu_frame, true)) => {
                 // A menu: click the entry we want.
-                shot("03_menu", &menu_frame);
                 let button = (if buy_x { tpls.buy_x.as_ref() } else { tpls.buy1.as_ref() })
                     .expect("button checked above");
                 let Some(bm) = best_match(&menu_frame, button, near, cfg.button_tolerance, 1) else {
+                    run.fail("menu", format!("{label} disappeared before the click"));
                     return Outcome::Failed(format!("{label} disappeared before the click"));
                 };
+                shot(
+                    "03_menu",
+                    &menu_frame,
+                    &[
+                        Stroke::new(near, annotate::YELLOW, 1),
+                        Stroke::new(rect_of(bm), annotate::GREEN, 2),
+                    ],
+                );
+                run.step("menu", format!("menu up; clicking {label} at ({},{})", bm.x, bm.y));
                 let (bx, by) = bm.center();
                 let Some((bsx, bsy)) = (unsafe { crate::window::client_to_screen(hwnd, bx, by) }) else {
                     return Outcome::Failed("client_to_screen failed for the buy button".into());
@@ -1948,10 +2156,12 @@ fn execute_inner(
                             best_match(f, prompt, area, cfg.button_tolerance, 1).is_some()
                         })
                     else {
+                        run.fail("amount", "screen capture failed while waiting for Enter amount");
                         return Outcome::Failed("screen capture failed while waiting for Enter amount".into());
                     };
-                    shot("04_amount", &prompt_frame);
+                    shot("04_amount", &prompt_frame, &[Stroke::new(area, annotate::CYAN, 1)]);
                     if !seen {
+                        run.fail("amount", format!("\"Enter amount\" not found within {}ms", cfg.amount_wait_ms));
                         return Outcome::Failed(format!(
                             "\"Enter amount\" not found within {}ms",
                             cfg.amount_wait_ms
@@ -1960,15 +2170,18 @@ fn execute_inner(
                     std::thread::sleep(Duration::from_millis(cfg.amount_pause_ms));
                     let want = amount_for(stack, verdict.qty_limit, verdict.bought);
                     if want <= 0 {
+                        run.fail("amount", "nothing left within the session cap");
                         return Outcome::Failed("nothing left within the session cap".into());
                     }
                     info!(want, stack, limit = verdict.qty_limit, bought = verdict.bought, "buy: typing the amount");
+                    run.step("amount", format!("typing {want} and pressing Enter"));
                     crate::input::type_digits(&want.to_string(), cfg.key_delay_ms);
                     std::thread::sleep(Duration::from_millis(cfg.enter_delay_ms));
                     crate::input::tap_enter(cfg.key_delay_ms);
                     want
                 } else {
                     info!("buy: Buy 1 clicked");
+                    run.step("buy", "Buy 1 clicked");
                     1
                 }
             }
@@ -1980,6 +2193,7 @@ fn execute_inner(
                 // successful purchase. Look for the menu on the last frame first.
                 if let Some((last, _)) = &menu {
                     if menu_ready(last) {
+                        run.warn("menu", "the buy menu appeared after the window; retrying");
                         return Outcome::Failed(
                             "the buy menu appeared after the window; retrying".into(),
                         );
@@ -1999,13 +2213,18 @@ fn execute_inner(
                 .map(|(_, ok)| ok)
                 .unwrap_or(false);
                 if !bought {
+                    run.fail(
+                        "menu",
+                        format!("right-click produced no {label} menu and the item is still listed"),
+                    );
                     return Outcome::Failed(format!(
                         "right-click produced no {label} menu and the item is still listed"
                     ));
                 }
-                shot("05_after", &shop);
+                shot("05_after", &shop, &[]);
                 let want = amount_for(stack, verdict.qty_limit, verdict.bought).max(1);
                 info!(items = want, "buy: right-click bought the item directly");
+                run.step("buy", "right-click bought the item directly");
                 want
             }
         }
@@ -2013,22 +2232,26 @@ fn execute_inner(
 
     std::thread::sleep(Duration::from_millis(400));
     if let Ok(f) = cap.capture_full_client() {
-        shot("05_after", &f);
+        shot("05_after", &f, &[]);
     }
 
     std::thread::sleep(Duration::from_millis(400));
     if let Ok(f) = cap.capture_full_client() {
-        shot("05_after", &f);
+        shot("05_after", &f, &[]);
     }
 
-    if let Err(e) = record_purchase(&name, units, verdict) {
-        warn!(error = %e, "could not record the purchase in Supabase");
+    match record_purchase(&name, units, verdict) {
+        Ok(()) => run.note("record", format!("recorded {units} against the session cap")),
+        Err(e) => {
+            warn!(error = %e, "could not record the purchase in Supabase");
+            run.warn("record", format!("could not record the purchase: {e}"));
+        }
     }
     // Leaving the shop is the caller's job (see `return_to_offers`): it has to
     // happen whatever the outcome, including a purchase that aborted half-way.
     // What state we actually left the game in — the market, or something else.
     if let Ok(f) = cap.capture_full_client() {
-        shot("06_back", &f);
+        shot("06_back", &f, &[]);
     }
     // Park the pointer somewhere inert, then put it back where the operator had
     // it. Done here rather than per click: a right-click's menu belongs to the
@@ -2541,5 +2764,89 @@ mod tests {
         if found > 0 {
             eprintln!("{found} frame(s) had a glow");
         }
+    }
+
+    /// Diagnostic: render an annotated shop frame to `target/annotated_sample.png`
+    /// so the boxes can be eyeballed against the region they are meant to mark.
+    #[test]
+    fn dump_annotated_sample_if_frame_present() {
+        let cfg = BuyConfig::default();
+        let glow = Rect {
+            x1: cfg.glow_rect[0],
+            y1: cfg.glow_rect[1],
+            x2: cfg.glow_rect[2],
+            y2: cfg.glow_rect[3],
+        };
+        let mut frames: Vec<std::path::PathBuf> = Vec::new();
+        // Newest runs' raw "after the buy" shop frames (unannotated).
+        if let Ok(runs) = std::fs::read_dir("data/buy") {
+            for e in runs.flatten() {
+                let p = e.path().join("frames").join("05_after.png");
+                if p.exists() {
+                    frames.push(p);
+                }
+            }
+        }
+        // Legacy flat shop frames.
+        if let Ok(entries) = std::fs::read_dir("data/buy") {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.to_string_lossy().ends_with("_02_shop.png") {
+                    frames.push(p);
+                }
+            }
+        }
+        frames.sort();
+        for p in frames.iter().rev() {
+            let f = load_frame(p);
+            let Some(g) = find_glow(&f, glow, &cfg) else {
+                continue;
+            };
+            let strokes = vec![
+                Stroke::new(glow, annotate::YELLOW, 1),
+                Stroke::new(rect_of(g), annotate::GREEN, 2),
+            ];
+            let out = annotate::annotated(&f, &strokes);
+            let _ = std::fs::create_dir_all("target");
+            let _ = crate::market::save_frame_png(
+                std::path::Path::new("target/annotated_sample.png"),
+                &out,
+            );
+            eprintln!("annotated {} glow at ({},{}) {}x{}", p.display(), g.x, g.y, g.w, g.h);
+            break;
+        }
+    }
+
+    /// Diagnostic: draw the change-watch region (cyan) and the shop search band
+    /// (yellow) over the last scanned frame, so the covered sections are clear.
+    #[test]
+    fn dump_scan_regions_if_frame_present() {
+        let p = std::path::Path::new("data/last_scan.png");
+        if !p.exists() {
+            return;
+        }
+        let f = load_frame(p);
+        let cfg = MarketConfig::default_config();
+        let watch = crate::market::watch_rect(&cfg.watch);
+        let glow = Rect {
+            x1: cfg.buy.glow_rect[0],
+            y1: cfg.buy.glow_rect[1],
+            x2: cfg.buy.glow_rect[2],
+            y2: cfg.buy.glow_rect[3],
+        };
+        let out = annotate::annotated(
+            &f,
+            &[
+                Stroke::new(watch, annotate::CYAN, 2),
+                Stroke::new(glow, annotate::YELLOW, 2),
+            ],
+        );
+        let _ = crate::market::save_frame_png(std::path::Path::new("target/scan_regions.png"), &out);
+        eprintln!(
+            "frame {}x{}  watch x{}..{} y{}..{}  glow x{}..{} y{}..{}",
+            f.width, f.height,
+            watch.x1, watch.x2, watch.y1, watch.y2,
+            glow.x1, glow.x2, glow.y1, glow.y2,
+        );
     }
 }

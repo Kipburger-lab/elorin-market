@@ -156,9 +156,12 @@ function setStatus(html) {
   paintStatus();
 }
 
-/// Fetch everything for the current window. `quiet` skips the loading flash for
-/// background refreshes, and identical data skips the DOM work entirely.
-async function load(quiet) {
+/// Fetch the dashboard. `quiet` skips the loading flash for background
+/// refreshes. `withSeries` pulls the per-item, per-bucket series too — that one
+/// is the heavy read (tens of thousands of rows), so a live refresh skips it and
+/// re-reads only the cheap summaries; the series then reloads on a window change,
+/// a manual reload, and the slow backstop.
+async function load(quiet, withSeries) {
   if (!CFG.supabaseUrl || CFG.supabaseUrl.includes("YOUR-PROJECT")) {
     setStatus(`Set <b>supabaseUrl</b> and <b>anonKey</b> in config.js`);
     return;
@@ -167,15 +170,20 @@ async function load(quiet) {
   state.since = Date.now() - w.ms;
   if (!quiet) setStatus("loading…");
   try {
-    const [items, series, hours, recent] = await Promise.all([
+    const [items, hours, recent, series] = await Promise.all([
       rpcPaged("item_stats", { since_ms: state.since }, "name"),
-      rpcPaged("item_series", { since_ms: state.since, bucket: w.bucket }, "name,b"),
       rpc("hour_index", { since_ms: state.since }),
       rpc("recent_offers", { lim: 200 }),
+      withSeries
+        ? rpcPaged("item_series", { since_ms: state.since, bucket: w.bucket }, "name,b")
+        : Promise.resolve(null),
     ]);
     state.items = (items || []).map(decorate).filter(i => i.name);
-    state.series = (series || []).map(s => ({ name: s.name, t: Date.parse(s.b), v: Number(s.median) || Number(s.avg) || 0 }))
-      .filter(s => s.name && !isNaN(s.t));
+    if (series) {
+      state.series = series
+        .map(s => ({ name: s.name, t: Date.parse(s.b), v: Number(s.median) || Number(s.avg) || 0 }))
+        .filter(s => s.name && !isNaN(s.t));
+    }
     state.hours = hours || [];
     state.recent = recent || [];
     state.updatedAt = Date.now();
@@ -576,11 +584,11 @@ $("tabs").addEventListener("click", e => {
   state.win = b.dataset.window;
   state.shown = PAGE;
   document.querySelectorAll("#tabs button").forEach(x => x.classList.toggle("active", x === b));
-  load();
+  load(false, true);
 });
 
 $("search").addEventListener("input", e => { state.search = e.target.value; state.shown = PAGE; render(); });
-$("reload").addEventListener("click", load);
+$("reload").addEventListener("click", () => load(false, true));
 
 document.querySelector("#items thead").addEventListener("click", e => {
   const th = e.target.closest("th[data-key]");
@@ -601,9 +609,43 @@ document.addEventListener("click", e => {
 $("detail").addEventListener("click", e => { if (e.target === $("detail")) closeDetail(); });
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeDetail(); });
 
+// ── Live updates ──────────────────────────────────────────────────────────
+// Supabase Realtime, guarded: one websocket instead of polling. Each `offers`
+// insert schedules a cheap stats-only refresh, debounced so the burst of rows a
+// single scan writes lands as one read. If the client script is missing or the
+// channel never connects, nothing breaks — the timer below is the fallback.
+// Only true once the channel really subscribes — a failed channel must not make
+// the timer think live updates are covered.
+let liveOk = false;
+function startLive() {
+  if (!window.supabase || !CFG.supabaseUrl || !CFG.anonKey) return;
+  try {
+    const sb = window.supabase.createClient(CFG.supabaseUrl, CFG.anonKey);
+    sb.channel("offers-live")
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "offers" }, scheduleLive)
+      .subscribe(status => { liveOk = status === "SUBSCRIBED"; });
+  } catch (e) {
+    console.warn("realtime unavailable; polling only", e);
+  }
+}
+
+let liveTimer = null;
+function scheduleLive() {
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => load(true, false), 2000);
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────
-load();
+load(false, true);
 setInterval(paintStatus, 1000);
+startLive();
 if (CFG.autoRefreshSeconds > 0) {
-  setInterval(() => load(true), CFG.autoRefreshSeconds * 1000);
+  // With Realtime subscribed, the timer is only a backstop and carries the
+  // series every fifth tick; without it, this is the whole update mechanism
+  // (exactly as before).
+  let tick = 0;
+  setInterval(() => {
+    tick += 1;
+    load(true, !liveOk || tick % 5 === 0);
+  }, CFG.autoRefreshSeconds * 1000);
 }

@@ -18,6 +18,12 @@ window.ELORIN_CONFIG = {
   // How many items to show in the best-investments strip.
   topInvestments: 12,
 
+  // "Interesting now" strip: items seen in the last N minutes whose median is
+  // above `freshMinMedian` gp and which still show a margin, ranked by margin.
+  freshMinutes: 60,
+  freshMinMedian: 20000000,
+  freshCount: 12,
+
   // Reload the data every N seconds (0 = off). Background refreshes are quiet —
   // identical data doesn't re-render, so this can be small.
   autoRefreshSeconds: 5,

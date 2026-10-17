@@ -81,12 +81,22 @@ pub fn right_click_screen(sx: i32, sy: i32) {
 /// Used while buying: a context menu tracks the pointer, so yanking it back to
 /// where the operator had it can dismiss the menu we are about to click.
 pub fn click_screen_keep(sx: i32, sy: i32) {
-    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy);
+    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy, CLICK_SETTLE, CLICK_RELAND);
+}
+
+/// Click the Refresh button: same as [`click_screen`] but with the short dwell,
+/// so the idle refresh loop isn't paced by the click.
+pub fn click_screen_fast(sx: i32, sy: i32) {
+    let saved = cursor_pos();
+    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy, FAST_SETTLE, FAST_RELAND);
+    if let Some((x, y)) = saved {
+        set_cursor_pos(x, y);
+    }
 }
 
 /// Right-click and leave the cursor there (see [`click_screen_keep`]).
 pub fn right_click_screen_keep(sx: i32, sy: i32) {
-    click_with(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, sx, sy);
+    click_with(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, sx, sy, CLICK_SETTLE, CLICK_RELAND);
 }
 
 /// Shift + left-click, leaving the cursor on the target.
@@ -98,7 +108,7 @@ pub fn right_click_screen_keep(sx: i32, sy: i32) {
 pub fn shift_click_screen_keep(sx: i32, sy: i32) {
     shift_down();
     std::thread::sleep(Duration::from_millis(40));
-    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy);
+    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy, CLICK_SETTLE, CLICK_RELAND);
     std::thread::sleep(Duration::from_millis(40));
     shift_up();
 }
@@ -157,14 +167,29 @@ fn virtual_desktop_size() -> (i32, i32) {
 /// Settle on the target before the button-down. The client needs to see the
 /// hover before it populates the option the click depends on (a context-menu
 /// entry, a shop slot); clicking sooner is how a click passes through the UI.
-const CLICK_SETTLE: Duration = Duration::from_millis(60);
+///
+/// Raised from 60 ms: the Open click regularly failed to register right after a
+/// refresh render, and the retry cost ~1.8 s — usually the whole snipe. The
+/// client is busy drawing the refreshed list at that moment, so it needs longer
+/// to both finish and take the hover before the button-down lands.
+const CLICK_SETTLE: Duration = Duration::from_millis(100);
 /// A fresh move immediately before the down: the client resolves a click against
 /// the most recent move it has processed, and a move from the start of the
 /// settle is not reliably still the one it is holding.
-const CLICK_RELAND: Duration = Duration::from_millis(15);
+///
+/// This is the dwell between that final move and the button-down — the window in
+/// which the client must take the hover. 15 ms was too tight (the click went
+/// through as if the pointer were elsewhere); ~50 ms is what the operator
+/// observed working.
+const CLICK_RELAND: Duration = Duration::from_millis(50);
 /// Down/up gap. Too short and the client drops the press instead of registering
 /// a real click.
 const CLICK_GAP: Duration = Duration::from_millis(15);
+/// A shorter dwell for clicks that don't resolve a hover — the Refresh button is
+/// a big target that reacts to the click alone. The idle refresh cadence is
+/// paced by the click, so these keep it fast.
+const FAST_SETTLE: Duration = Duration::from_millis(40);
+const FAST_RELAND: Duration = Duration::from_millis(15);
 
 /// Where the pointer is parked between actions, in screen coordinates.
 ///
@@ -220,11 +245,18 @@ fn glide(sx: i32, sy: i32) {
 /// right-click opens a menu that belongs to that position, and moving away
 /// straight afterwards is what stopped the menu ever appearing. The purchase
 /// parks the pointer itself with [`recover`] once the menu work is finished.
-fn click_with(down: MOUSE_EVENT_FLAGS, up: MOUSE_EVENT_FLAGS, sx: i32, sy: i32) {
+fn click_with(
+    down: MOUSE_EVENT_FLAGS,
+    up: MOUSE_EVENT_FLAGS,
+    sx: i32,
+    sy: i32,
+    settle: Duration,
+    reland: Duration,
+) {
     glide(sx, sy);
-    std::thread::sleep(CLICK_SETTLE);
+    std::thread::sleep(settle);
     move_cursor(sx, sy);
-    std::thread::sleep(CLICK_RELAND);
+    std::thread::sleep(reland);
     send_mouse(down);
     std::thread::sleep(CLICK_GAP);
     send_mouse(up);

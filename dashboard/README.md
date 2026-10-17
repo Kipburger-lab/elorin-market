@@ -65,12 +65,14 @@ manager zeroes them without restarting the scanner.
 
 ## Deploy (free, GitHub Pages)
 
-Settings → Pages → **Deploy from a branch** → branch / `(root)` → Save.
+Publishing is automatic: `.github/workflows/deploy.yml` runs on every push to
+`main`, copies `dashboard/*` into `_site/dashboard/`, and deploys that to the
+`gh-pages` branch (Pages serves `gh-pages`). So **push `main` — nothing else**.
 Live at <https://kipburger-lab.github.io/elorin-market/>.
 
-Note: Pages currently publishes the `gh-pages` branch, so a change pushed to
-`main` also has to be merged into `gh-pages` (or switch the Pages source to
-`main` and drop the extra branch).
+The dashboard also updates **live** via Supabase Realtime (`offers` inserts);
+`supabase_phase3.sql` adds the table to the `supabase_realtime` publication, which
+that needs. If Realtime can't connect it silently falls back to polling.
 
 Open it on a phone and use "Add to Home Screen" for a full-screen app-like view.
 Bookmark `manager.html` directly — nothing links to it.

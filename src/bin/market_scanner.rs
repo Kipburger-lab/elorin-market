@@ -324,7 +324,6 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
             &v,
             &app.tpls,
             &app.cfg,
-            app.ocr.as_ref(),
             &app.cfg.icon,
             &app.cfg.buy,
             &app.cfg.discord,
@@ -511,6 +510,22 @@ fn loop_thread() {
         // Keep the OS pointer off the panel for every capture this pass.
         park_cursor(hwnd, &app.cfg);
 
+        // The change-watch region, and its *region-local* rect. The poll captures
+        // the region alone, so its pixels must be hashed with a rect anchored at
+        // the region's own origin. Indexing a region frame with the absolute watch
+        // coords silently clamped to the frame and hashed only the bottom-right
+        // corner — the top rows went unwatched — while hashing a *full* frame with
+        // the same coords covers the whole region. Mixing those two bases fired a
+        // "change" every single pass. With the local rect the region-frame hash
+        // equals the full-frame hash (same pixels, same order).
+        let wr = market::watch_rect(&app.cfg.watch);
+        let watch_local = elorin_bot::market::RectCfg {
+            x1: 0,
+            y1: 0,
+            x2: wr.width(),
+            y2: wr.height(),
+        };
+
         // Seed the "previous" set once so the first change doesn't store the
         // whole list that was already there.
         if !seeded {
@@ -555,7 +570,9 @@ fn loop_thread() {
                     let (cx, cy) = m.center();
                     match unsafe { window::client_to_screen(hwnd, cx, cy) } {
                         Some((sx, sy)) => {
-                            input::click_screen(sx, sy);
+                            // The fast variant: the Refresh button doesn't resolve a
+                            // hover, and this click paces the whole idle loop.
+                            input::click_screen_fast(sx, sy);
                             // Lift the pointer off the button the instant the click
                             // lands, so its sprite is back before the next find.
                             park_cursor(hwnd, &app.cfg);
@@ -601,7 +618,6 @@ fn loop_thread() {
             //    Refresh again and this window is what paces the idle refresh rate:
             //    a shorter window refreshes more often, but must still be long enough
             //    for a render to land, or the change is missed and clicked over.
-            let wr = market::watch_rect(&app.cfg.watch);
             // Compare against the last state we *scanned* (not a fresh baseline),
             // so an update that rendered between passes is still caught on the
             // next poll instead of being absorbed.
@@ -609,7 +625,7 @@ fn loop_thread() {
                 last_watch = cap
                     .capture_region(wr)
                     .ok()
-                    .map(|f| market::signature(&f, app.cfg.watch));
+                    .map(|f| market::signature(&f, watch_local));
             }
             let poll = Duration::from_millis(app.cfg.refresh.poll_ms.max(1));
             let started = Instant::now();
@@ -621,7 +637,7 @@ fn loop_thread() {
             {
                 std::thread::sleep(poll);
                 if let Ok(f) = cap.capture_region(wr) {
-                    let sig = market::signature(&f, app.cfg.watch);
+                    let sig = market::signature(&f, watch_local);
                     if Some(sig) != last_watch {
                         changed = true;
                         break;
@@ -634,7 +650,10 @@ fn loop_thread() {
                 // Nothing changed, but an eligible item can still be sitting on
                 // the list — one armed mid-run, or a purchase that failed. Act on
                 // the last scan, so it is always bought, change or not.
-                if !last_rows.is_empty() {
+                // Only pay for a capture when there is actually something to act
+                // on — `plan` is cheap (rules are cached) and most passes have
+                // nothing armed.
+                if !last_rows.is_empty() && !elorin_bot::buy::plan(&last_rows).is_empty() {
                     if let Ok(f) = cap.capture_full_client() {
                         force_scan = try_buy(&app, hwnd, &cap, &f, &last_rows);
                     }
@@ -654,7 +673,7 @@ fn loop_thread() {
             while Instant::now() < settle_deadline && stable < 2 {
                 std::thread::sleep(poll);
                 if let Ok(f) = cap.capture_region(wr) {
-                    let sig = market::signature(&f, app.cfg.watch);
+                    let sig = market::signature(&f, watch_local);
                     if sig == last {
                         stable += 1;
                     } else {

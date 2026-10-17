@@ -40,6 +40,10 @@ pub struct BuyConfig {
     pub poll_ms: u64,
     /// Price context window (the median/p10 come from this many days).
     pub lookback_days: u32,
+    /// How long a cached rules snapshot may be trusted before buying stops. If
+    /// Supabase can't be reached, the per-item caps and the snipe ration can't be
+    /// enforced, so the bot stops buying rather than spend on a frozen rulebook.
+    pub rules_stale_ms: u64,
     /// Where to write a PNG at every step of a purchase ("" disables).
     pub debug_dir: String,
     /// Record every purchase attempt to `<debug_dir>/<tag>/<tag>.mp4`, from just
@@ -64,6 +68,13 @@ pub struct BuyConfig {
     pub enter_delay_ms: u64,
     /// How long the seller's shop may take to replace the market panel.
     pub shop_wait_ms: u64,
+    /// Settle before clicking Open. The change that triggers a buy is seen the
+    /// moment the refreshed list *starts* to repaint, so the render can still be
+    /// in flight when we scan and click — and a click landing mid-render is
+    /// swallowed. That is why the first Open click often failed while the retry,
+    /// on an idle client ~2 s later, always worked; this reproduces that idle
+    /// state up front instead of paying the retry. 0 disables it.
+    pub pre_open_ms: u64,
     /// How long the market may take to come back after a purchase.
     pub market_back_ms: u64,
     /// Beat after a purchase lands, before clicking Return to leave the shop.
@@ -201,6 +212,7 @@ impl Default for BuyConfig {
             dry_run: true,
             poll_ms: 5_000,
             lookback_days: 30,
+            rules_stale_ms: 30_000,
             debug_dir: "data/buy".to_string(),
             record_purchases: true,
             record_fps: 8,
@@ -211,7 +223,8 @@ impl Default for BuyConfig {
             amount_rect: [0, 330, 811, 571],
             amount_pause_ms: 300,
             enter_delay_ms: 300,
-            shop_wait_ms: 1_200,
+            shop_wait_ms: 1_800,
+            pre_open_ms: 200,
             market_back_ms: 2_500,
             after_buy_ms: 1_000,
             recent_offers_ms: 3_000,
@@ -228,7 +241,7 @@ impl Default for BuyConfig {
             glow_max_size: 40,
             glow_min_size: 16,
             glow_max_fill: 1.0,
-            icon_profile_max_dist: 25.0,
+            icon_profile_max_dist: 30.0,
             menu_radius: 140,
             recover_client: [629, 265],
             menu_settle_ms: 150,
@@ -400,6 +413,13 @@ struct Cache {
     last_error: Option<String>,
     /// Last heartbeat we published, so we don't write one per loop tick.
     last_beat: Option<Instant>,
+    /// When the rules were last fetched *successfully*. A failed fetch still sets
+    /// `at` (so we don't hammer the network), which means a throttled `refresh`
+    /// answers `Ok` on a stale cache — this is the real freshness signal.
+    last_ok: Option<Instant>,
+    /// Throttle for the "rules are stale" warning, so it is one line, not one
+    /// per pass.
+    last_stale_warn: Option<Instant>,
 }
 
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
@@ -413,8 +433,42 @@ fn cache() -> &'static Mutex<Cache> {
             settings: Settings::default(),
             last_error: None,
             last_beat: None,
+            last_ok: None,
+            last_stale_warn: None,
         })
     })
+}
+
+/// Whether the rules were fetched recently enough to buy on.
+///
+/// The per-item caps and the big-snipe ration live in Supabase and are read from
+/// it every cycle. If we cannot reach it, the counters we'd write back never
+/// land — so running on a frozen snapshot would ignore the caps and the bot
+/// would keep buying. When the rules go stale we therefore **stop buying** until
+/// Supabase answers again, rather than spend on a rulebook we can no longer
+/// enforce. `rules_stale_ms` bounds how long a snapshot is trusted.
+fn rules_fresh() -> bool {
+    let Some(cfg) = CFG.get() else {
+        return false;
+    };
+    let limit = Duration::from_millis(cfg.rules_stale_ms.max(1_000));
+    let mut c = cache().lock();
+    let fresh = c.last_ok.map(|t| t.elapsed() < limit).unwrap_or(false);
+    if !fresh {
+        let due = c
+            .last_stale_warn
+            .map(|t| t.elapsed() >= Duration::from_secs(10))
+            .unwrap_or(true);
+        if due {
+            c.last_stale_warn = Some(Instant::now());
+            warn!(
+                limit_ms = cfg.rules_stale_ms,
+                "buy rules are stale — not buying until Supabase is reachable again"
+            );
+            println!("  buy PAUSED: the rules could not be fetched for >{}ms — not buying", cfg.rules_stale_ms);
+        }
+    }
+    fresh
 }
 
 /// Publish our mode + a liveness stamp, throttled to roughly every 20 s. Runs
@@ -515,6 +569,7 @@ fn refresh(force: bool) -> Result<()> {
             c.settings = settings;
             c.last_error = None;
             c.at = Some(Instant::now());
+            c.last_ok = Some(Instant::now());
             Ok(())
         }
         Err(e) => {
@@ -532,6 +587,9 @@ pub fn report(rows: &[RowReading]) {
     }
     if let Err(e) = refresh(false) {
         warn!(error = %e, "could not refresh buy rules");
+        return;
+    }
+    if !rules_fresh() {
         return;
     }
     let (rules, settings, err) = {
@@ -639,6 +697,11 @@ pub fn plan(rows: &[RowReading]) -> Vec<(usize, Verdict)> {
     }
     if let Err(e) = refresh(false) {
         warn!(error = %e, "could not refresh buy rules");
+        return Vec::new();
+    }
+    // A throttled `refresh` can answer `Ok` on a stale cache, so gate on the last
+    // *successful* fetch: no fresh rules, no buys.
+    if !rules_fresh() {
         return Vec::new();
     }
     let (rules, settings) = {
@@ -1729,7 +1792,6 @@ pub fn execute(
     verdict: &Verdict,
     tpls: &MarketTemplates,
     market_cfg: &MarketConfig,
-    ocr: Option<&crate::ocr::Ocr>,
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
     discord_cfg: &crate::discord::DiscordConfig,
@@ -1760,7 +1822,7 @@ pub fn execute(
         )
     });
     let outcome = execute_inner(
-        exe_dir, hwnd, cap, frame, row, verdict, tpls, market_cfg, ocr, icon_cfg, cfg, &tag, &run,
+        exe_dir, hwnd, cap, frame, row, verdict, tpls, market_cfg, icon_cfg, cfg, &tag, &run,
     );
 
     match &outcome {
@@ -1843,7 +1905,6 @@ fn execute_inner(
     verdict: &Verdict,
     tpls: &MarketTemplates,
     market_cfg: &MarketConfig,
-    ocr: Option<&crate::ocr::Ocr>,
     icon_cfg: &IconCfg,
     cfg: &BuyConfig,
     tag: &str,
@@ -1890,27 +1951,44 @@ fn execute_inner(
     //
     // The list can re-render between the scan and this click — a new offer
     // shuffles the rows down — so the pixel our row sat on may now be a
-    // different item. Re-find the row on a fresh frame first (price-anchored, no
-    // OCR) and click *that* Open button; if the row is gone, abort rather than
-    // open a stranger's shop on a stale coordinate. A false miss is harmless —
-    // the caller rescans and retries.
+    // different item. Verify on a fresh frame first, but cheaply: one price read
+    // at the row's own band (~a few ms) confirms it is still there. Only when
+    // that fails (the row moved) do we pay for a full re-find, and only when
+    // *that* finds nothing do we give up.
+    //
+    // Settle first: a click landing while the client is still repainting the
+    // refreshed list is swallowed (the retry only worked because the client was
+    // idle by then).
+    if cfg.pre_open_ms > 0 {
+        std::thread::sleep(Duration::from_millis(cfg.pre_open_ms));
+        run.note("open", format!("settled {}ms before opening", cfg.pre_open_ms));
+    }
     let (cx, cy) = row.open.center();
     let mut target = (cx, cy);
     if let Ok(fresh) = cap.capture_full_client() {
-        match relocate_row(&fresh, tpls, market_cfg, None, row) {
-            Some(m) => {
-                let (mx, my) = m.center();
-                target = (mx, my);
-                if (mx, my) != (cx, cy) {
+        let same = crate::market::read_price(
+            &fresh,
+            tpls,
+            row.band,
+            market_cfg.scan.digit_tolerance,
+            market_cfg.scan.overlap_ratio,
+        )
+        .price
+            == row.read.price;
+        if same {
+            run.note("open", format!("row verified in place at ({cx},{cy})"));
+        } else {
+            match relocate_row(&fresh, tpls, market_cfg, None, row) {
+                Some(m) => {
+                    let (mx, my) = m.center();
+                    target = (mx, my);
                     info!(from_x = cx, from_y = cy, to_x = mx, to_y = my, "buy: the row moved; clicking its new position");
                     run.note("open", format!("row moved from ({cx},{cy}) to ({mx},{my}); clicking the verified position"));
-                } else {
-                    run.note("open", format!("row verified in place at ({cx},{cy})"));
                 }
-            }
-            None => {
-                run.warn("open", "the offer left the list before we could click Open");
-                return Outcome::Gone { name };
+                None => {
+                    run.warn("open", "the offer left the list before we could click Open");
+                    return Outcome::Gone { name };
+                }
             }
         }
     }
@@ -1939,19 +2017,40 @@ fn execute_inner(
     for attempt in 0..2 {
         if attempt == 0 {
             crate::input::click_screen_keep(sx, sy);
+            // Lift the pointer off the list the instant the click lands. The
+            // capture includes the OS cursor, and `click_screen_keep` leaves it
+            // resting on the Open button — which then hides that sprite, so the
+            // retry's re-scan can't find it (and once the shop opens the cursor
+            // sits inside the shop's search band). Same trick the loop uses after
+            // clicking Refresh.
+            crate::input::recover();
         } else {
-            let mut retry = (sx, sy);
-            if let Ok(fresh) = cap.capture_full_client() {
-                if let Some(m) = relocate_row(&fresh, tpls, market_cfg, ocr, row) {
-                    let (mx, my) = m.center();
-                    if let Some(s) = (unsafe { crate::window::client_to_screen(hwnd, mx, my) }) {
-                        retry = s;
-                    }
-                }
+            // The first click may have opened the shop a moment after the wait
+            // gave up. Re-check before clicking again: a blind second click lands
+            // where the *list* was — which, with the shop now open, is some other
+            // control (or an item), exactly the stray click we don't want. Only
+            // click when the row has been re-found; otherwise stop and re-scan.
+            let Ok(fresh) = cap.capture_full_client() else {
+                break;
+            };
+            if shop_is_open(&fresh, tpls, cfg.button_tolerance) {
+                opened = Some(fresh);
+                break;
             }
-            info!(x = retry.0, y = retry.1, "buy: the shop did not open; re-finding the row and clicking Open again");
-            run.warn("open", "the shop did not open; re-finding the row and clicking Open again");
-            crate::input::click_screen_keep(retry.0, retry.1);
+            // Price-anchored, no OCR: name matching was skipping the row outright
+            // when the truncated/OCR'd name read differently, so a row that was
+            // plainly there looked gone. Matches the pre-click verify.
+            let Some(m) = relocate_row(&fresh, tpls, market_cfg, None, row) else {
+                run.fail("open", "the shop did not open and the row is gone; not clicking again");
+                break;
+            };
+            let (mx, my) = m.center();
+            let Some((rx, ry)) = (unsafe { crate::window::client_to_screen(hwnd, mx, my) }) else {
+                break;
+            };
+            info!(x = rx, y = ry, "buy: the shop did not open; clicking the re-found row's Open again");
+            run.warn("open", "the shop did not open; clicking Open again on the re-found row");
+            crate::input::click_screen_keep(rx, ry);
         }
         match wait_for(cap, cfg.shop_wait_ms, |f| shop_is_open(f, tpls, cfg.button_tolerance)) {
             Some((f, true)) => {

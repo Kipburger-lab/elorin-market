@@ -9,6 +9,9 @@ const CFG = Object.assign({
   minObservations: 4,
   topInvestments: 12,
   autoRefreshSeconds: 60,
+  freshMinutes: 60,
+  freshMinMedian: 20000000,
+  freshCount: 12,
 }, window.ELORIN_CONFIG || {});
 
 const WINDOWS = {
@@ -27,6 +30,7 @@ const state = {
   sort: { key: "pct", dir: -1 },
   shown: PAGE,
   items: [],
+  fresh: [],
   series: [],
   hours: [],
   recent: [],
@@ -170,15 +174,18 @@ async function load(quiet, withSeries) {
   state.since = Date.now() - w.ms;
   if (!quiet) setStatus("loading…");
   try {
-    const [items, hours, recent, series] = await Promise.all([
+    const [items, hours, recent, series, fresh] = await Promise.all([
       rpcPaged("item_stats", { since_ms: state.since }, "name"),
       rpc("hour_index", { since_ms: state.since }),
       rpc("recent_offers", { lim: 200 }),
       withSeries
         ? rpcPaged("item_series", { since_ms: state.since, bucket: w.bucket }, "name,b")
         : Promise.resolve(null),
+      // The "interesting now" strip always looks at its own, short window.
+      rpcPaged("item_stats", { since_ms: Date.now() - CFG.freshMinutes * 60000 }, "name"),
     ]);
     state.items = (items || []).map(decorate).filter(i => i.name);
+    state.fresh = (fresh || []).map(decorate).filter(i => i.name);
     if (series) {
       state.series = series
         .map(s => ({ name: s.name, t: Date.parse(s.b), v: Number(s.median) || Number(s.avg) || 0 }))
@@ -194,7 +201,8 @@ async function load(quiet, withSeries) {
     // Only touch the DOM when something actually changed, so a 5 s refresh
     // cadence doesn't flicker or fight the user's scrolling.
     const sig = state.win + "|" + state.items.map(i => `${i.name}:${i.n}:${i.low}:${i.median}:${i.last}`).join(",")
-      + "|" + state.hours.map(h => `${h.hour}:${h.n}:${h.idx}`).join(",");
+      + "|" + state.hours.map(h => `${h.hour}:${h.n}:${h.idx}`).join(",")
+      + "|" + state.fresh.map(i => `${i.name}:${i.low}:${i.median}`).join(",");
     if (sig !== state.signature) {
       state.signature = sig;
       render();
@@ -227,6 +235,7 @@ function decorate(it) {
 function render() {
   const y = window.scrollY;
   renderBest();
+  renderFresh();
   renderItems();
   renderInsights();
   window.scrollTo(0, y);
@@ -256,6 +265,35 @@ function renderBest() {
           <span class="pct ${i.pct >= 0 ? "up" : "down"}">${fmtPct(i.pct)}</span>
         </div>
         <div class="sub">buy ≤ ${fmt(i.low)} · sell ~${fmt(i.median)} · fee ${fmt(Math.round(i.fee))} (${i.n} seen)</div>
+      </div>
+    </div>`).join("");
+}
+
+/// "Interesting now": items seen in the last short window whose median clears
+/// `freshMinMedian` and which still show a margin — the shortlist to look at
+/// right now, independent of the Day/Week/Month tab.
+function renderFresh() {
+  const min = CFG.freshMinMedian;
+  $("freshHint").textContent =
+    `last ${CFG.freshMinutes} min · median > ${fmtCompact(min)} gp · margin = buy low → sell median, ${Math.round(CFG.feeRate * 100)}% fee`;
+  const list = state.fresh
+    .filter(i => i.median > min && i.low > 0 && i.profit > 0)
+    .sort((a, b) => b.pct - a.pct)
+    .slice(0, CFG.freshCount);
+  const el = $("fresh");
+  if (!list.length) {
+    el.innerHTML = `<div class="empty">Nothing over ${fmtCompact(min)} with a margin in the last ${CFG.freshMinutes} min yet.</div>`;
+    return;
+  }
+  el.innerHTML = list.map(i => `
+    <div class="card${matches(i.name) ? " hit" : ""}" data-name="${esc(i.name)}">
+      ${iconTag(i.icon, 28)}
+      <div class="grow">
+        <div class="row1">
+          <span class="nm">${hl(i.name)}</span>
+          <span class="pct ${i.pct >= 0 ? "up" : "down"}">${fmtPct(i.pct)}</span>
+        </div>
+        <div class="sub">buy ≤ ${fmt(i.low)} · sell ~${fmt(i.median)} · +${fmtCompact(i.profit)} gp (${i.n} seen)</div>
       </div>
     </div>`).join("");
 }

@@ -355,7 +355,7 @@ fn short_gap_secs(b: BreakCfg) -> u64 {
 /// The caller parks the pointer first. Nothing is pressed or bought while away,
 /// and `maybe_heartbeat` keeps ticking — so the manager banner and the
 /// server-side dead-man's switch see a live scanner, not a stalled one.
-fn take_break(seconds: u64, label: &str) {
+fn take_break(discord: &elorin_bot::discord::DiscordConfig, seconds: u64, label: &str) {
     if seconds == 0 {
         return;
     }
@@ -363,6 +363,9 @@ fn take_break(seconds: u64, label: &str) {
     info!(label, minutes = mins, "loop: taking a break");
     println!("  break: {} ({} min) — pausing on the offers list", label, mins);
     set_status(&format!("loop: {} break ({} min)", label, mins));
+    // Say so on the purchases webhook, so a quiet stretch reads as a break
+    // rather than as the scanner having died.
+    elorin_bot::discord::notify_break(discord.clone(), label.to_string(), mins);
     let end = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < end
         && !EXIT_REQUESTED.load(Ordering::Relaxed)
@@ -585,11 +588,11 @@ fn loop_thread() {
                 if at_offers {
                     let b = app.cfg.breaks;
                     if long_due {
-                        take_break(b.long_break_min * 60, "long");
+                        take_break(&app.cfg.discord, b.long_break_min * 60, "long");
                         next_long = Some(now + Duration::from_secs(b.long_every_min * 60));
                         next_short = Some(now + Duration::from_secs(short_gap_secs(b)));
                     } else {
-                        take_break(b.short_break_min * 60, "short");
+                        take_break(&app.cfg.discord, b.short_break_min * 60, "short");
                         next_short = Some(now + Duration::from_secs(short_gap_secs(b)));
                     }
                     continue;

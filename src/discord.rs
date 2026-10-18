@@ -446,6 +446,38 @@ fn send_recording(cfg: &DiscordConfig, name: &str, path: &Path, id: &str) -> Res
     )
 }
 
+/// Announce on the purchases webhook that the loop is taking a break.
+///
+/// A break is deliberate downtime, so it belongs in the same channel as the
+/// purchases: an unexplained gap between buys is otherwise indistinguishable
+/// from a scanner that has quietly died. Fire-and-forget — the caller is about
+/// to sleep anyway.
+pub fn notify_break(cfg: DiscordConfig, label: String, minutes: u64) {
+    if !cfg.is_configured() {
+        return;
+    }
+    thread::spawn(move || {
+        if let Err(e) = send_break(&cfg, &label, minutes) {
+            warn!(error = %e, "discord break notification failed");
+        }
+    });
+}
+
+fn send_break(cfg: &DiscordConfig, label: &str, minutes: u64) -> Result<()> {
+    let embed = Embed {
+        title: format!("On a {label} break · {minutes} min"),
+        color: 0x95A5A6,
+        description: Some(format!(
+            "Parked on the recent offers list — no refreshes and no buys — resuming in about {minutes} min."
+        )),
+        fields: Vec::new(),
+        image: None,
+        thumbnail: None,
+        footer: None,
+    };
+    send(cfg, vec![embed], Vec::new(), 20)
+}
+
 /// Notify that the scanner got stuck, optionally attaching the recorded MP4.
 ///
 /// Runs on the **calling** thread and only returns once the post has been

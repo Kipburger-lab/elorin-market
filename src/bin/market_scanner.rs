@@ -567,12 +567,14 @@ fn loop_thread() {
             match market::find_refresh(&full, &app.tpls, app.cfg.refresh.tolerance) {
                 Some(m) => {
                     stuck = 0;
-                    let (cx, cy) = m.center();
-                    match unsafe { window::client_to_screen(hwnd, cx, cy) } {
+                    // Land somewhere on the button rather than the same pixel on
+                    // every pass, and vary the press below — a fixed point on a
+                    // fixed beat is exactly what reads as autoclicking.
+                    let jx = m.x + m.w / 4 + input::rand_between(0, (m.w / 2).max(1) as u64) as i32;
+                    let jy = m.y + m.h / 4 + input::rand_between(0, (m.h / 2).max(1) as u64) as i32;
+                    match unsafe { window::client_to_screen(hwnd, jx, jy) } {
                         Some((sx, sy)) => {
-                            // The fast variant: the Refresh button doesn't resolve a
-                            // hover, and this click paces the whole idle loop.
-                            input::click_screen_fast(sx, sy);
+                            input::click_screen_human(sx, sy);
                             // Lift the pointer off the button the instant the click
                             // lands, so its sprite is back before the next find.
                             park_cursor(hwnd, &app.cfg);
@@ -629,7 +631,9 @@ fn loop_thread() {
             }
             let poll = Duration::from_millis(app.cfg.refresh.poll_ms.max(1));
             let started = Instant::now();
-            let deadline = started + Duration::from_millis(app.cfg.refresh.timeout_ms);
+            // Vary the pause too (about ±30%) so the refresh isn't on a metronome.
+            let wait_ms = app.cfg.refresh.timeout_ms * input::rand_between(70, 131) / 100;
+            let deadline = started + Duration::from_millis(wait_ms);
             let mut changed = false;
             while Instant::now() < deadline
                 && LOOP_ACTIVE.load(Ordering::SeqCst)

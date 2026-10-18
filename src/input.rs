@@ -81,14 +81,31 @@ pub fn right_click_screen(sx: i32, sy: i32) {
 /// Used while buying: a context menu tracks the pointer, so yanking it back to
 /// where the operator had it can dismiss the menu we are about to click.
 pub fn click_screen_keep(sx: i32, sy: i32) {
-    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy, CLICK_SETTLE, CLICK_RELAND);
+    click_with(
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+        sx,
+        sy,
+        CLICK_SETTLE,
+        CLICK_RELAND,
+        CLICK_GAP,
+    );
 }
 
-/// Click the Refresh button: same as [`click_screen`] but with the short dwell,
-/// so the idle refresh loop isn't paced by the click.
-pub fn click_screen_fast(sx: i32, sy: i32) {
+/// A click with humanlike variation: a longer, randomly jittered hover before the
+/// press, and a press held for a varied time instead of a fixed 15 ms. Used for
+/// the Refresh button, whose perfectly regular clicks were flagged as autoclicking.
+pub fn click_screen_human(sx: i32, sy: i32) {
     let saved = cursor_pos();
-    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy, FAST_SETTLE, FAST_RELAND);
+    click_with(
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+        sx,
+        sy,
+        Duration::from_millis(rand_between(90, 170)),
+        Duration::from_millis(rand_between(35, 80)),
+        Duration::from_millis(rand_between(45, 110)),
+    );
     if let Some((x, y)) = saved {
         set_cursor_pos(x, y);
     }
@@ -96,7 +113,15 @@ pub fn click_screen_fast(sx: i32, sy: i32) {
 
 /// Right-click and leave the cursor there (see [`click_screen_keep`]).
 pub fn right_click_screen_keep(sx: i32, sy: i32) {
-    click_with(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, sx, sy, CLICK_SETTLE, CLICK_RELAND);
+    click_with(
+        MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP,
+        sx,
+        sy,
+        CLICK_SETTLE,
+        CLICK_RELAND,
+        CLICK_GAP,
+    );
 }
 
 /// Shift + left-click, leaving the cursor on the target.
@@ -108,7 +133,15 @@ pub fn right_click_screen_keep(sx: i32, sy: i32) {
 pub fn shift_click_screen_keep(sx: i32, sy: i32) {
     shift_down();
     std::thread::sleep(Duration::from_millis(40));
-    click_with(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, sx, sy, CLICK_SETTLE, CLICK_RELAND);
+    click_with(
+        MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP,
+        sx,
+        sy,
+        CLICK_SETTLE,
+        CLICK_RELAND,
+        CLICK_GAP,
+    );
     std::thread::sleep(Duration::from_millis(40));
     shift_up();
 }
@@ -185,11 +218,34 @@ const CLICK_RELAND: Duration = Duration::from_millis(50);
 /// Down/up gap. Too short and the client drops the press instead of registering
 /// a real click.
 const CLICK_GAP: Duration = Duration::from_millis(15);
-/// A shorter dwell for clicks that don't resolve a hover — the Refresh button is
-/// a big target that reacts to the click alone. The idle refresh cadence is
-/// paced by the click, so these keep it fast.
-const FAST_SETTLE: Duration = Duration::from_millis(40);
-const FAST_RELAND: Duration = Duration::from_millis(15);
+/// A tiny xorshift PRNG for humanlike variation (click position, press duration,
+/// pause between refreshes). Deliberately not cryptography — just enough that a
+/// long run doesn't look like the same pixel being hit on a fixed beat.
+fn rand_u32() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static STATE: AtomicU32 = AtomicU32::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0x9E37_79B9)
+            | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    STATE.store(x, Ordering::Relaxed);
+    x
+}
+
+/// A random value in `[lo, hi)`.
+pub fn rand_between(lo: u64, hi: u64) -> u64 {
+    if hi <= lo {
+        return lo;
+    }
+    lo + (rand_u32() as u64) % (hi - lo)
+}
 
 /// Where the pointer is parked between actions, in screen coordinates.
 ///
@@ -252,13 +308,14 @@ fn click_with(
     sy: i32,
     settle: Duration,
     reland: Duration,
+    gap: Duration,
 ) {
     glide(sx, sy);
     std::thread::sleep(settle);
     move_cursor(sx, sy);
     std::thread::sleep(reland);
     send_mouse(down);
-    std::thread::sleep(CLICK_GAP);
+    std::thread::sleep(gap);
     send_mouse(up);
     std::thread::sleep(Duration::from_millis(20));
 }

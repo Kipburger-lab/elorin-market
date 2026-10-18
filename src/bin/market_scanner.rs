@@ -616,16 +616,24 @@ fn loop_thread() {
         } else {
             force_streak = 0;
 
-            // 1. Click Refresh.
-            let full = match cap.capture_full_client() {
-                Ok(f) => f,
+            // 1. Click Refresh — after validating it on this fresh frame.
+            //
+            // The market UI can exit between passes (a forced quit, a crash, the
+            // client dropping out of the panel). A position is only good for the
+            // frame it came from, so check immediately before clicking: the
+            // Refresh button must still be there AND the offers list must be up
+            // (an Open button present). Requiring the Open too rejects a
+            // Refresh-shaped coincidence in the game world, which would otherwise
+            // let the loop consider itself healthy while it clicks the world.
+            let verified = match cap.capture_full_client() {
+                Ok(f) => market::find_refresh_verified(&f, &app.tpls, &app.cfg),
                 Err(e) => {
                     set_status(&format!("capture failed: {e}"));
                     std::thread::sleep(Duration::from_millis(300));
                     continue;
                 }
             };
-            match market::find_refresh(&full, &app.tpls, app.cfg.refresh.tolerance) {
+            match verified {
                 Some(m) => {
                     stuck = 0;
                     // Land somewhere on the button rather than the same pixel on
@@ -648,7 +656,7 @@ fn loop_thread() {
                     }
                 }
                 None => {
-                    set_status("loop: Refresh button not found");
+                    set_status("loop: market list is not up (no Refresh/Open)");
                     stuck += 1;
                     // The client drops out of the market window when a purchase
                     // empties a shop or the buy is refused. Before recording that as

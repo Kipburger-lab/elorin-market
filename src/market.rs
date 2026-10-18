@@ -1247,6 +1247,23 @@ pub fn find_refresh(frame: &Frame, tpls: &MarketTemplates, tolerance: u8) -> Opt
     template::find(frame, tpl, tolerance)
 }
 
+/// The Refresh button, but only when the offers list is actually up.
+///
+/// An Open button is the tell: it exists only in that panel, so a Refresh-shaped
+/// pixel somewhere in the game world can't fake the market being open. Callers
+/// use this immediately before clicking — if the UI has exited since the last
+/// look, the answer is `None` and no click is sent at a stale position.
+pub fn find_refresh_verified(
+    frame: &Frame,
+    tpls: &MarketTemplates,
+    cfg: &MarketConfig,
+) -> Option<Match> {
+    if template::find(frame, &tpls.open, cfg.scan.open_tolerance).is_none() {
+        return None;
+    }
+    find_refresh(frame, tpls, cfg.refresh.tolerance)
+}
+
 /// Identity of a row for duplicate detection: (name, seller, price).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowKey {

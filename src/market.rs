@@ -249,10 +249,19 @@ impl Default for RectCfg {
 pub struct RefreshCfg {
     /// How often to poll for a change after clicking Refresh.
     pub poll_ms: u64,
-    /// Give up waiting for a change after this long and click Refresh again.
+    /// Legacy fixed window, used only when `idle_max_ms <= idle_min_ms`.
+    #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     /// Per-channel tolerance for matching Refresh.png.
     pub tolerance: u8,
+    /// The pause before clicking Refresh again when nothing changed, drawn fresh
+    /// each pass from `[idle_min_ms, idle_max_ms]`. A fresh draw per pass is the
+    /// point: the cadence is irregular — sometimes quick, sometimes a few
+    /// seconds — rather than one fixed beat.
+    #[serde(default = "default_idle_min_ms")]
+    pub idle_min_ms: u64,
+    #[serde(default = "default_idle_max_ms")]
+    pub idle_max_ms: u64,
     /// After a change is seen, wait until the watch region holds still for two
     /// polls before scanning — the first change can be a half-drawn list, and
     /// scanning that partial render misses the item until the next refresh.
@@ -263,6 +272,18 @@ pub struct RefreshCfg {
 
 fn default_settle_ms() -> u64 {
     200
+}
+
+fn default_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_idle_min_ms() -> u64 {
+    600
+}
+
+fn default_idle_max_ms() -> u64 {
+    2_800
 }
 
 /// `[breaks]` — humanlike pauses so a long run isn't one unbroken session of
@@ -300,9 +321,11 @@ impl Default for RefreshCfg {
     fn default() -> Self {
         Self {
             poll_ms: 5,
-            timeout_ms: 2000,
+            timeout_ms: 2_000,
             tolerance: 25,
             settle_ms: 200,
+            idle_min_ms: 600,
+            idle_max_ms: 2_800,
         }
     }
 }

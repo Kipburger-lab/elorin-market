@@ -639,8 +639,8 @@ fn loop_thread() {
                     // Land somewhere on the button rather than the same pixel on
                     // every pass, and vary the press below — a fixed point on a
                     // fixed beat is exactly what reads as autoclicking.
-                    let jx = m.x + m.w / 4 + input::rand_between(0, (m.w / 2).max(1) as u64) as i32;
-                    let jy = m.y + m.h / 4 + input::rand_between(0, (m.h / 2).max(1) as u64) as i32;
+                    let jx = m.x + m.w / 5 + input::rand_between(0, (m.w * 3 / 5).max(1) as u64) as i32;
+                    let jy = m.y + m.h / 5 + input::rand_between(0, (m.h * 3 / 5).max(1) as u64) as i32;
                     match unsafe { window::client_to_screen(hwnd, jx, jy) } {
                         Some((sx, sy)) => {
                             input::click_screen_human(sx, sy);
@@ -700,8 +700,15 @@ fn loop_thread() {
             }
             let poll = Duration::from_millis(app.cfg.refresh.poll_ms.max(1));
             let started = Instant::now();
-            // Vary the pause too (about ±30%) so the refresh isn't on a metronome.
-            let wait_ms = app.cfg.refresh.timeout_ms * input::rand_between(70, 131) / 100;
+            // Draw the pause fresh each pass: sometimes quick, sometimes a few
+            // seconds, so the refresh isn't on a metronome.
+            let rc = app.cfg.refresh;
+            let (lo, hi) = if rc.idle_max_ms > rc.idle_min_ms {
+                (rc.idle_min_ms, rc.idle_max_ms)
+            } else {
+                (rc.timeout_ms, rc.timeout_ms)
+            };
+            let wait_ms = input::rand_between(lo, hi + 1).max(250);
             let deadline = started + Duration::from_millis(wait_ms);
             let mut changed = false;
             while Instant::now() < deadline

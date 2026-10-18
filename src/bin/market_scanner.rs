@@ -689,13 +689,23 @@ fn loop_thread() {
                             continue;
                         }
                     }
-                    // Not recoverable and not moving: record a window of the client
-                    // so whatever happened can be reviewed afterwards. Once per
-                    // episode, not on every pass.
-                    if stuck == STUCK_AFTER {
-                        let video = record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
+                    // Recovery has failed since REOPEN_AFTER and the panel is
+                    // still not back: record one window of the client so whatever
+                    // happened can be reviewed, send one alert, and stop.
+                    //
+                    // Once, then out. Repeating it — as this used to — only filled
+                    // the disk and the channel, and clicking on would keep poking
+                    // at a screen the loop cannot read. `notify_stuck` posts
+                    // inline and `request_exit` wakes the message pump, so the
+                    // alert and its recording survive the shutdown.
+                    if stuck >= STUCK_AFTER {
+                        warn!(stuck, "loop: stuck - recording once, then shutting down");
+                        let video =
+                            record_client(&cap, &app.exe_dir, 30, &app.cfg.window.title_contains);
                         elorin_bot::discord::notify_stuck(app.cfg.discord.clone(), video);
-                        stuck = 0;
+                        set_status("loop: stuck - shutting down");
+                        request_exit();
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(300));
                     continue;

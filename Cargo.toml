@@ -24,6 +24,8 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
+    # GetCurrentThreadId: the pump registers itself so a background thread can wake it.
+    "Win32_System_Threading",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Com",
     # Local wall-clock timestamps for the run logs.

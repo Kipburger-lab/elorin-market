@@ -1,7 +1,9 @@
 //! Discord webhook notifications for purchases and stuck states.
 //!
 //! Notifications are sent from a detached thread so the buy loop never blocks on
-//! the network. Discord's webhook endpoint accepts a `payload_json` form field
+//! the network. The stuck alert is the exception: it runs inline, because by the
+//! time it fires the caller is about to shut the process down and a detached post
+//! would die with it. Discord's webhook endpoint accepts a `payload_json` form field
 //! plus file attachments; we build the multipart body manually so there are no
 //! extra crate dependencies.
 //!
@@ -445,15 +447,18 @@ fn send_recording(cfg: &DiscordConfig, name: &str, path: &Path, id: &str) -> Res
 }
 
 /// Notify that the scanner got stuck, optionally attaching the recorded MP4.
+///
+/// Runs on the **calling** thread and only returns once the post has been
+/// attempted. The caller shuts the process down right after this, so a detached
+/// post (which is right for the per-purchase messages) would be killed mid-flight
+/// along with the recording.
 pub fn notify_stuck(cfg: DiscordConfig, video_path: Option<PathBuf>) {
     if !cfg.is_configured() {
         return;
     }
-    thread::spawn(move || {
-        if let Err(e) = send_stuck(&cfg, video_path.as_deref()) {
-            warn!(error = %e, "discord stuck notification failed");
-        }
-    });
+    if let Err(e) = send_stuck(&cfg, video_path.as_deref()) {
+        warn!(error = %e, "discord stuck notification failed");
+    }
 }
 
 fn send_stuck(cfg: &DiscordConfig, video_path: Option<&Path>) -> Result<()> {

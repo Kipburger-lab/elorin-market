@@ -40,6 +40,12 @@ pub fn run(
 ) -> Result<()> {
     let _ = NEEDLE.set(needle);
     let _ = OWNED.set(owned);
+
+    // Register this thread as the message pump: `request_exit` can be called from
+    // a background thread (the loop going stuck) and has to be able to wake it.
+    crate::set_main_thread_id(unsafe {
+        windows::Win32::System::Threading::GetCurrentThreadId()
+    });
     let _ = ON_DOWN.set(Box::new(on_down));
 
     let hinst = unsafe { GetModuleHandleW(None) }.map_err(|e| anyhow!("GetModuleHandleW: {e}"))?;

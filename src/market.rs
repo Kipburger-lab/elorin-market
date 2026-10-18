@@ -41,6 +41,9 @@ pub struct MarketConfig {
     pub watch: RectCfg,
     #[serde(default)]
     pub refresh: RefreshCfg,
+    /// Humanlike breaks (pause the loop for a while now and then).
+    #[serde(default)]
+    pub breaks: BreakCfg,
     pub output: OutputCfg,
     pub hotkeys: HotkeysCfg,
     /// Optional push of the collected offers to the online dashboard.
@@ -262,6 +265,37 @@ fn default_settle_ms() -> u64 {
     200
 }
 
+/// `[breaks]` — humanlike pauses so a long run isn't one unbroken session of
+/// clicks. A break parks the pointer and does nothing: no refresh, no buys.
+/// The heartbeat keeps ticking, so a break never looks like a dead scanner.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BreakCfg {
+    pub enable: bool,
+    /// Short break every `short_every_min`..`short_every_max_min` minutes.
+    pub short_every_min: u64,
+    pub short_every_max_min: u64,
+    /// ...lasting this many minutes.
+    pub short_break_min: u64,
+    /// Long break every `long_every_min` minutes of session, lasting
+    /// `long_break_min` minutes.
+    pub long_every_min: u64,
+    pub long_break_min: u64,
+}
+
+impl Default for BreakCfg {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            short_every_min: 20,
+            short_every_max_min: 30,
+            short_break_min: 2,
+            long_every_min: 180,
+            long_break_min: 30,
+        }
+    }
+}
+
 impl Default for RefreshCfg {
     fn default() -> Self {
         Self {
@@ -346,6 +380,7 @@ impl MarketConfig {
             icon: IconCfg::default(),
             watch: RectCfg::default(),
             refresh: RefreshCfg::default(),
+            breaks: BreakCfg::default(),
             cloud: crate::cloud::CloudConfig::default(),
             buy: crate::buy::BuyConfig::default(),
             discord: crate::discord::DiscordConfig::default(),

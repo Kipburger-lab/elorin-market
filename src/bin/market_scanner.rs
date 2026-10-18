@@ -26,7 +26,9 @@ use elorin_bot::capture::gdi::GdiCapturer;
 use elorin_bot::capture::{Frame, Rect};
 use elorin_bot::hotkeys::{self, Debounce};
 use elorin_bot::input;
-use elorin_bot::market::{self, MarketConfig, MarketTemplates, RowKey, RowReading, ScanResult};
+use elorin_bot::market::{
+    self, BreakCfg, MarketConfig, MarketTemplates, RowKey, RowReading, ScanResult,
+};
 use elorin_bot::ocr::Ocr;
 use elorin_bot::overlay::{self, Painter, CYAN, GRAY, GREEN, MAGENTA, ORANGE, WHITE, YELLOW};
 use elorin_bot::{request_exit, window, EXIT_REQUESTED};
@@ -341,6 +343,37 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
     false
 }
 
+/// A randomised short-break gap in seconds, drawn from the `[breaks]` window.
+fn short_gap_secs(b: BreakCfg) -> u64 {
+    let lo = b.short_every_min.min(b.short_every_max_min).max(1) * 60;
+    let hi = b.short_every_min.max(b.short_every_max_min).max(1) * 60;
+    input::rand_between(lo, hi + 1)
+}
+
+/// Pause the loop for `seconds`, doing nothing but keeping the heartbeat alive.
+///
+/// The caller parks the pointer first. Nothing is pressed or bought while away,
+/// and `maybe_heartbeat` keeps ticking — so the manager banner and the
+/// server-side dead-man's switch see a live scanner, not a stalled one.
+fn take_break(seconds: u64, label: &str) {
+    if seconds == 0 {
+        return;
+    }
+    let mins = (seconds + 59) / 60;
+    info!(label, minutes = mins, "loop: taking a break");
+    println!("  break: {} ({} min) — pausing on the offers list", label, mins);
+    set_status(&format!("loop: {} break ({} min)", label, mins));
+    let end = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < end
+        && !EXIT_REQUESTED.load(Ordering::Relaxed)
+        && LOOP_ACTIVE.load(Ordering::SeqCst)
+    {
+        elorin_bot::buy::maybe_heartbeat();
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    info!(label, "loop: break over");
+}
+
 /// A cheap fingerprint of a frame, to notice when the picture changes.
 ///
 /// Samples a slice of the buffer rather than hashing all of it: this only has to
@@ -456,6 +489,9 @@ fn loop_thread() {
     // The rows from the last scan, so an eligible item can be acted on even when
     // the list doesn't change (see the no-change branch).
     let mut last_rows: Vec<RowReading> = Vec::new();
+    // Break schedule (humanlike pauses). Set when the loop (re)starts.
+    let mut next_short: Option<Instant> = None;
+    let mut next_long: Option<Instant> = None;
 
     while !EXIT_REQUESTED.load(Ordering::Relaxed) {
         // Tell the manager we're alive and which mode we're in (throttled).
@@ -526,6 +562,25 @@ fn loop_thread() {
             y2: wr.height(),
         };
 
+        // Humanlike breaks. While away nothing is clicked or bought; the pointer
+        // is already parked and the offers list is left as it is.
+        if app.cfg.breaks.enable {
+            let now = Instant::now();
+            let long_due = next_long.map(|t| now >= t).unwrap_or(false);
+            let short_due = next_short.map(|t| now >= t).unwrap_or(false);
+            if long_due {
+                take_break(app.cfg.breaks.long_break_min * 60, "long");
+                next_long = Some(now + Duration::from_secs(app.cfg.breaks.long_every_min * 60));
+                next_short = Some(now + Duration::from_secs(short_gap_secs(app.cfg.breaks)));
+                continue;
+            }
+            if short_due {
+                take_break(app.cfg.breaks.short_break_min * 60, "short");
+                next_short = Some(now + Duration::from_secs(short_gap_secs(app.cfg.breaks)));
+                continue;
+            }
+        }
+
         // Seed the "previous" set once so the first change doesn't store the
         // whole list that was already there.
         if !seeded {
@@ -533,6 +588,12 @@ fn loop_thread() {
                 let r = market::scan(&f, &app.tpls, &app.cfg, app.ocr.as_ref());
                 prev = r.rows.iter().map(market::row_key).collect();
                 seeded = true;
+                // A fresh loop-on gets a fresh break schedule.
+                let b = app.cfg.breaks;
+                next_short =
+                    Some(Instant::now() + Duration::from_secs(short_gap_secs(b)));
+                next_long =
+                    Some(Instant::now() + Duration::from_secs(b.long_every_min * 60));
                 last_watch = Some(market::signature(&f, app.cfg.watch));
                 // Check what's already on screen before seeding ends the pass:
                 // the opening scan is often the most useful one.

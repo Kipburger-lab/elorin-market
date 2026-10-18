@@ -564,20 +564,38 @@ fn loop_thread() {
 
         // Humanlike breaks. While away nothing is clicked or bought; the pointer
         // is already parked and the offers list is left as it is.
+        //
+        // A break only starts when the offers list is actually up. That is the
+        // point of one — park the client on the recent offers overview — and it
+        // must not freeze it inside a shop or out in the world mid-recovery. A
+        // pass reaches here *after* the buy flow has finished and returned to the
+        // offers, so this is a confirmation, not the thing that keeps us out of
+        // the shop. If the list isn't up, the break stays due and fires on the
+        // next pass that is.
         if app.cfg.breaks.enable {
             let now = Instant::now();
             let long_due = next_long.map(|t| now >= t).unwrap_or(false);
             let short_due = next_short.map(|t| now >= t).unwrap_or(false);
-            if long_due {
-                take_break(app.cfg.breaks.long_break_min * 60, "long");
-                next_long = Some(now + Duration::from_secs(app.cfg.breaks.long_every_min * 60));
-                next_short = Some(now + Duration::from_secs(short_gap_secs(app.cfg.breaks)));
-                continue;
-            }
-            if short_due {
-                take_break(app.cfg.breaks.short_break_min * 60, "short");
-                next_short = Some(now + Duration::from_secs(short_gap_secs(app.cfg.breaks)));
-                continue;
+            if long_due || short_due {
+                let at_offers = cap
+                    .capture_full_client()
+                    .ok()
+                    .map(|f| market::find_refresh_verified(&f, &app.tpls, &app.cfg).is_some())
+                    .unwrap_or(false);
+                if at_offers {
+                    let b = app.cfg.breaks;
+                    if long_due {
+                        take_break(b.long_break_min * 60, "long");
+                        next_long = Some(now + Duration::from_secs(b.long_every_min * 60));
+                        next_short = Some(now + Duration::from_secs(short_gap_secs(b)));
+                    } else {
+                        take_break(b.short_break_min * 60, "short");
+                        next_short = Some(now + Duration::from_secs(short_gap_secs(b)));
+                    }
+                    continue;
+                }
+                set_status("loop: break due - waiting for the offers list");
+                info!("loop: break due but the offers list is not up - deferring");
             }
         }
 

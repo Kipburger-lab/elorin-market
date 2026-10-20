@@ -753,7 +753,18 @@ fn loop_thread() {
             } else {
                 (rc.timeout_ms, rc.timeout_ms)
             };
-            let wait_ms = input::rand_between(lo, hi + 1).max(250);
+            // Mostly the short band; now and then a longer gap. A flat spread
+            // reads like a uniform random generator, where a human is steady
+            // with the occasional pause (a glance away, reading a row) — this
+            // keeps the average near 1 s without the rhythm being fixed.
+            let long = rc.idle_long_ms > hi
+                && input::rand_between(0, 100) < rc.idle_long_pct.min(100);
+            let wait_ms = if long {
+                input::rand_between(hi, rc.idle_long_ms + 1)
+            } else {
+                input::rand_between(lo, hi + 1)
+            }
+            .max(250);
             let deadline = started + Duration::from_millis(wait_ms);
             let mut changed = false;
             while Instant::now() < deadline

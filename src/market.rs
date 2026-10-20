@@ -256,12 +256,19 @@ pub struct RefreshCfg {
     pub tolerance: u8,
     /// The pause before clicking Refresh again when nothing changed, drawn fresh
     /// each pass from `[idle_min_ms, idle_max_ms]`. A fresh draw per pass is the
-    /// point: the cadence is irregular — sometimes quick, sometimes a few
-    /// seconds — rather than one fixed beat.
+    /// point: no two gaps are identical.
     #[serde(default = "default_idle_min_ms")]
     pub idle_min_ms: u64,
     #[serde(default = "default_idle_max_ms")]
     pub idle_max_ms: u64,
+    /// Now and then take a longer gap instead: `idle_long_pct` percent of passes
+    /// draw from `[idle_max_ms, idle_long_ms]`. Keeps the average low and steady
+    /// while still breaking the rhythm up — a human is fairly consistent with the
+    /// odd pause, not uniform across a wide band.
+    #[serde(default = "default_idle_long_pct")]
+    pub idle_long_pct: u64,
+    #[serde(default = "default_idle_long_ms")]
+    pub idle_long_ms: u64,
     /// After a change is seen, wait until the watch region holds still for two
     /// polls before scanning — the first change can be a half-drawn list, and
     /// scanning that partial render misses the item until the next refresh.
@@ -279,11 +286,19 @@ fn default_timeout_ms() -> u64 {
 }
 
 fn default_idle_min_ms() -> u64 {
-    750
+    550
 }
 
 fn default_idle_max_ms() -> u64 {
-    1_300
+    850
+}
+
+fn default_idle_long_pct() -> u64 {
+    12
+}
+
+fn default_idle_long_ms() -> u64 {
+    1_700
 }
 
 /// `[breaks]` — humanlike pauses so a long run isn't one unbroken session of
@@ -338,8 +353,10 @@ impl Default for RefreshCfg {
             timeout_ms: 2_000,
             tolerance: 25,
             settle_ms: 200,
-            idle_min_ms: 750,
-            idle_max_ms: 1_300,
+            idle_min_ms: 550,
+            idle_max_ms: 850,
+            idle_long_pct: 12,
+            idle_long_ms: 1_700,
         }
     }
 }

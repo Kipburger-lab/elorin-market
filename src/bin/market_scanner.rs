@@ -343,6 +343,14 @@ fn try_buy(app: &App, hwnd: HWND, cap: &GdiCapturer, full: &Frame, rows: &[RowRe
     false
 }
 
+/// A break's length in whole minutes, drawn from `lo..=hi` (clamped so a bad
+/// config can't produce a zero-length or inverted range).
+fn break_minutes(lo: u64, hi: u64) -> u64 {
+    let lo = lo.max(1);
+    let hi = hi.max(lo);
+    input::rand_between(lo, hi + 1)
+}
+
 /// A randomised short-break gap in seconds, drawn from the `[breaks]` window.
 fn short_gap_secs(b: BreakCfg) -> u64 {
     let lo = b.short_every_min.min(b.short_every_max_min).max(1) * 60;
@@ -587,14 +595,20 @@ fn loop_thread() {
                     .unwrap_or(false);
                 if at_offers {
                     let b = app.cfg.breaks;
-                    if long_due {
-                        take_break(&app.cfg.discord, b.long_break_min * 60, "long");
-                        next_long = Some(now + Duration::from_secs(b.long_every_min * 60));
-                        next_short = Some(now + Duration::from_secs(short_gap_secs(b)));
+                    let (label, mins) = if long_due {
+                        ("long", break_minutes(b.long_break_min, b.long_break_max_min))
                     } else {
-                        take_break(&app.cfg.discord, b.short_break_min * 60, "short");
-                        next_short = Some(now + Duration::from_secs(short_gap_secs(b)));
+                        ("short", break_minutes(b.short_break_min, b.short_break_max_min))
+                    };
+                    take_break(&app.cfg.discord, mins * 60, label);
+                    // Count the next gap from the resume, not the start: the break
+                    // is downtime, and with a 5-10 min pause it would otherwise eat
+                    // most of the running time that follows it.
+                    let resumed = Instant::now();
+                    if long_due {
+                        next_long = Some(resumed + Duration::from_secs(b.long_every_min * 60));
                     }
+                    next_short = Some(resumed + Duration::from_secs(short_gap_secs(b)));
                     continue;
                 }
                 set_status("loop: break due - waiting for the offers list");

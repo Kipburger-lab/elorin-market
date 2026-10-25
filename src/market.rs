@@ -286,11 +286,11 @@ fn default_timeout_ms() -> u64 {
 }
 
 fn default_idle_min_ms() -> u64 {
-    550
+    350
 }
 
 fn default_idle_max_ms() -> u64 {
-    850
+    650
 }
 
 fn default_idle_long_pct() -> u64 {
@@ -298,7 +298,7 @@ fn default_idle_long_pct() -> u64 {
 }
 
 fn default_idle_long_ms() -> u64 {
-    1_700
+    1_400
 }
 
 /// `[breaks]` — humanlike pauses so a long run isn't one unbroken session of
@@ -324,7 +324,7 @@ pub struct BreakCfg {
 }
 
 fn default_short_break_max_min() -> u64 {
-    10
+    4
 }
 
 fn default_long_break_max_min() -> u64 {
@@ -335,10 +335,10 @@ impl Default for BreakCfg {
     fn default() -> Self {
         Self {
             enable: true,
-            short_every_min: 20,
-            short_every_max_min: 30,
-            short_break_min: 5,
-            short_break_max_min: 10,
+            short_every_min: 42,
+            short_every_max_min: 48,
+            short_break_min: 2,
+            short_break_max_min: 4,
             long_every_min: 180,
             long_break_min: 30,
             long_break_max_min: 40,
@@ -353,10 +353,10 @@ impl Default for RefreshCfg {
             timeout_ms: 2_000,
             tolerance: 25,
             settle_ms: 200,
-            idle_min_ms: 550,
-            idle_max_ms: 850,
+            idle_min_ms: 350,
+            idle_max_ms: 650,
             idle_long_pct: 12,
-            idle_long_ms: 1_700,
+            idle_long_ms: 1_400,
         }
     }
 }

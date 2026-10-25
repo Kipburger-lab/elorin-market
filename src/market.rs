@@ -286,11 +286,11 @@ fn default_timeout_ms() -> u64 {
 }
 
 fn default_idle_min_ms() -> u64 {
-    350
+    180
 }
 
 fn default_idle_max_ms() -> u64 {
-    650
+    350
 }
 
 fn default_idle_long_pct() -> u64 {
@@ -298,7 +298,7 @@ fn default_idle_long_pct() -> u64 {
 }
 
 fn default_idle_long_ms() -> u64 {
-    1_400
+    1_000
 }
 
 /// `[breaks]` — humanlike pauses so a long run isn't one unbroken session of
@@ -353,10 +353,10 @@ impl Default for RefreshCfg {
             timeout_ms: 2_000,
             tolerance: 25,
             settle_ms: 200,
-            idle_min_ms: 350,
-            idle_max_ms: 650,
+            idle_min_ms: 180,
+            idle_max_ms: 350,
             idle_long_pct: 12,
-            idle_long_ms: 1_400,
+            idle_long_ms: 1_000,
         }
     }
 }
